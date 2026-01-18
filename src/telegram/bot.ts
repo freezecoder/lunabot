@@ -5,21 +5,29 @@
 
 import { Telegraf, Context, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
+import { readFileSync } from 'fs';
 import { Agent, StreamEvent } from '../agent/agent.js';
 import { OllamaProvider } from '../agent/providers/ollama.js';
 import { ToolRegistry } from '../tools/registry.js';
 import { getAllBuiltInTools } from '../tools/built-in/index.js';
 import { loadSkillsFromDirectory } from '../tools/skill-loader.js';
+import { loadSkillsFromDirectory as loadMdSkills } from '../skills/loader.js';
 import { SessionManager } from './session/manager.js';
 import { MODEL_CAPABILITIES } from '../router/router.js';
+import { loadContext, buildSystemPrompt } from '../context/loader.js';
+import type { SkillEntry } from '../skills/types.js';
 import 'dotenv/config';
 
 // Configuration
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://100.121.61.16:11434';
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'llama3.1:8b';
+const REASONING_MODEL = process.env.REASONING_MODEL || 'qwen2.5:32b';  // Smarter model for chat/planning
+const TOOL_MODEL = process.env.TOOL_MODEL || DEFAULT_MODEL;            // Faster model for tool execution
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(Number).filter(Boolean);
 const SKILLS_DIR = process.env.SKILLS_DIR || './skills';
+const CONTEXT_DIR = process.env.CONTEXT_DIR || '/Users/zayed/clawd';
+const AGENT_DIR = process.env.AGENT_DIR || './agent';
 
 // Initialize components
 const provider = new OllamaProvider({ host: OLLAMA_HOST });
@@ -31,6 +39,9 @@ registry.registerAll(getAllBuiltInTools());
 
 // Agent will be initialized after async skill loading
 let agent: Agent;
+
+// Prompt skills for auto-injection
+let promptSkills: SkillEntry[] = [];
 
 // Message update throttle (avoid rate limits)
 const UPDATE_INTERVAL = 1000; // 1 second
@@ -69,28 +80,195 @@ function formatMessage(content: string, toolInfo?: string): string {
 }
 
 /**
+ * Keyword patterns for skill matching
+ */
+const SKILL_KEYWORDS: Record<string, string[]> = {
+  'genomics-report': ['genomics report', 'pipeline report', 'job report', 'status report', 'generate report', 'summarize job', 'analyze job', 'daily report', 'failure report'],
+  'genomics-jobs': ['tibanna', 'genomics', 'amplicon', 'wgs', 'basespace', 'sequencing', 'pipeline job', 'showjobs', 'show job', 'cromwell', 'ec2 job', 'aws job'],
+  'gog': ['gmail', 'google calendar', 'google drive', 'calendar event', 'google sheets', 'google docs'],
+  'slack-monitor': ['slack message', 'slack mention', 'check slack'],
+  'openhands': ['openhands', 'coding agent', 'autonomous coding'],
+};
+
+/**
+ * Direct command mappings for common skill queries
+ * Maps user intent patterns to specific bash commands
+ */
+const SKILL_COMMANDS: Record<string, Array<{ patterns: string[]; command: string; description: string }>> = {
+  'genomics-report': [
+    { patterns: ['generate report', 'create report', 'make report', 'status report', 'daily report', 'pipeline report'],
+      command: '/Users/zayed/clawd/scripts/genomics-report.sh',
+      description: 'Generate a comprehensive genomics pipeline status report' },
+    { patterns: ['failure report', 'failed report', 'what failed', 'analyze failure'],
+      command: '/Users/zayed/clawd/scripts/genomics-report.sh "What jobs failed and what might have caused them?"',
+      description: 'Generate a report focused on failures' },
+    { patterns: ['quick report', 'fast report', 'job report'],
+      command: '/Users/zayed/clawd/scripts/genomics-report.sh "job summary" --jobs-only',
+      description: 'Quick jobs-only report' },
+  ],
+  'genomics-jobs': [
+    // Basic job listing
+    { patterns: ['show job', 'check job', 'job status', 'my job', 'tibanna status', 'tibanna job', 'what job', 'any job', 'jobs running', 'list job'],
+      command: 'showjobs -short -n 20',
+      description: 'Show recent Tibanna jobs (compact view)' },
+    // Summary/counts
+    { patterns: ['job summary', 'summary', 'job count', 'how many job', 'status count', 'status summary'],
+      command: `showjobs -n 50 2>&1 | grep -E '^\\|[^-]' | awk -F'|' '{print $7}' | sed 's/ //g' | grep -v jstatus | sort | uniq -c`,
+      description: 'Summary count of jobs by status' },
+    // Failed jobs
+    { patterns: ['failed job', 'job fail', 'what fail', 'error job', 'failure'],
+      command: 'showjobs -n 30 -status failed -fields jobid,description,modified',
+      description: 'Show recent failed jobs' },
+    // Running jobs
+    { patterns: ['running job', 'active job', 'in progress', 'currently running'],
+      command: 'showjobs -status running -fields jobid,description,projectid,time',
+      description: 'Show currently running jobs' },
+    // Completed jobs
+    { patterns: ['completed job', 'finished job', 'done job', 'successful job'],
+      command: 'showjobs -n 30 -status completed -fields jobid,description,time',
+      description: 'Show recently completed jobs' },
+    // EC2 instances
+    { patterns: ['show ec2', 'ec2 instance', 'running instance', 'instance status'],
+      command: 'showec2',
+      description: 'Show EC2 instances running genomics jobs' },
+    // Logs
+    { patterns: ['tibanna log', 'job log', 'workflow log', 'get log'],
+      command: 'tibanna log -j <JOB_ID>',
+      description: 'Get logs for a specific Tibanna job (need job ID)' },
+    // BaseSpace
+    { patterns: ['list project', 'basespace project', 'sequencing run', 'find project', 'bs project', 'illumina project'],
+      command: `ssh -i /Users/zayed/hsnri/hsnri.pem ubuntu@18.233.64.31 'bash -l -c "bs list projects"'`,
+      description: 'List BaseSpace projects (runs on remote server)' },
+    // Tibanna stats
+    { patterns: ['tibanna stat', 'stat -n', 'recent run'],
+      command: 'tibanna stat -n 10',
+      description: 'Show statistics for the 10 most recent Tibanna runs' },
+    // Today's jobs
+    { patterns: ['today job', 'job today', 'today summary', 'today status'],
+      command: `showjobs -n 100 2>&1 | grep "$(date +%Y-%m-%d)" | awk -F'|' '{print $7}' | sed 's/ //g' | sort | uniq -c`,
+      description: 'Summary of today\'s jobs by status' },
+  ],
+};
+
+/**
+ * Find a direct command match for a user query
+ */
+function findDirectCommand(message: string, skillName: string): { command: string; description: string } | null {
+  const lower = message.toLowerCase();
+  const commands = SKILL_COMMANDS[skillName];
+  if (!commands) return null;
+
+  for (const { patterns, command, description } of commands) {
+    for (const pattern of patterns) {
+      if (lower.includes(pattern)) {
+        return { command, description };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Match a message to a skill based on keywords
+ */
+function matchSkillByKeywords(message: string, skills: SkillEntry[]): SkillEntry | null {
+  const lower = message.toLowerCase();
+
+  for (const skill of skills) {
+    const keywords = SKILL_KEYWORDS[skill.name] || [];
+    for (const keyword of keywords) {
+      if (lower.includes(keyword)) {
+        return skill;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Build skills section for system prompt (brief listing)
+ */
+function buildSkillsPromptSection(skills: SkillEntry[]): string {
+  if (skills.length === 0) return '';
+
+  const lines = [
+    '\n\n## Available Skills',
+    '',
+  ];
+
+  for (const skill of skills) {
+    lines.push(`- **${skill.name}**: ${skill.description.slice(0, 100)}...`);
+  }
+
+  return lines.join('\n');
+}
+
+/**
  * Create the bot
  */
 async function createBot(): Promise<Telegraf> {
-  // Load skills from directory
-  try {
-    const skills = await loadSkillsFromDirectory(SKILLS_DIR);
-    registry.registerAll(skills);
-    console.log(`Loaded ${skills.length} custom skills`);
-  } catch (error) {
-    console.log('No custom skills loaded:', error);
+  // Load YAML/JSON tool skills from multiple directories
+  const skillsDirs = [SKILLS_DIR, `${AGENT_DIR}/skills`, `${CONTEXT_DIR}/skills`];
+  let totalToolSkills = 0;
+
+  for (const skillsPath of skillsDirs) {
+    try {
+      const skills = await loadSkillsFromDirectory(skillsPath);
+      if (skills.length > 0) {
+        registry.registerAll(skills);
+        totalToolSkills += skills.length;
+        console.log(`Loaded ${skills.length} tool skills from ${skillsPath}`);
+      }
+    } catch {
+      // Directory doesn't exist or no skills found
+    }
   }
 
-  // Initialize agent
+  // Load MD prompt skills (SKILL.md files with YAML frontmatter)
+  const mdSkillsDirs = [`${CONTEXT_DIR}/skills`, `${AGENT_DIR}/skills`];
+  const mdSkills: SkillEntry[] = [];
+
+  for (const skillsPath of mdSkillsDirs) {
+    try {
+      const skills = await loadMdSkills(skillsPath, 'workspace');
+      if (skills.length > 0) {
+        mdSkills.push(...skills);
+        console.log(`Loaded ${skills.length} prompt skills from ${skillsPath}`);
+      }
+    } catch {
+      // Directory doesn't exist or no skills found
+    }
+  }
+  console.log(`Total skills: ${totalToolSkills} tools, ${mdSkills.length} prompts`);
+
+  // Store for message-level skill injection
+  promptSkills = mdSkills;
+
+  // Load context (SOUL, IDENTITY, USER, etc.)
+  const context = await loadContext(CONTEXT_DIR, AGENT_DIR);
+  let systemPrompt = buildSystemPrompt(context, registry.getSummary());
+
+  // Append skill descriptions to system prompt
+  if (mdSkills.length > 0) {
+    const skillsSection = buildSkillsPromptSection(mdSkills);
+    systemPrompt += skillsSection;
+  }
+
+  console.log(`Loaded context from ${context.sources.length} source(s): ${context.sources.join(', ')}`);
+
+  // Initialize agent with context-aware system prompt
   agent = new Agent({
     provider,
     registry,
-    defaultModel: DEFAULT_MODEL,
+    systemPrompt,
+    defaultModel: REASONING_MODEL,
     routerConfig: {
-      reasoningModel: DEFAULT_MODEL,
-      toolCallingModel: DEFAULT_MODEL,
+      reasoningModel: REASONING_MODEL,   // qwen2.5:32b - for understanding, planning, reading skills
+      toolCallingModel: TOOL_MODEL,       // llama3.1:8b - for fast tool execution
     },
   });
+
+  console.log(`Hybrid router: reasoning=${REASONING_MODEL}, tools=${TOOL_MODEL}`);
 
   const bot = new Telegraf(BOT_TOKEN);
 
@@ -288,15 +466,61 @@ async function createBot(): Promise<Telegraf> {
   // Handle text messages
   bot.on(message('text'), async (ctx) => {
     const chatId = ctx.chat.id;
-    const userMessage = ctx.message.text;
+    let userMessage = ctx.message.text;
     const session = sessions.get(chatId, ctx.from?.username);
     const prefs = sessions.getPreferences(chatId);
+
+    // Auto-inject skill content if keywords match
+    const matchedSkill = matchSkillByKeywords(userMessage, promptSkills);
+    let directCommand: { command: string; description: string } | null = null;
+
+    if (matchedSkill) {
+      // First, check for a direct command match (more targeted)
+      directCommand = findDirectCommand(userMessage, matchedSkill.name);
+
+      if (directCommand) {
+        // Direct command match - give model a simple, direct instruction
+        userMessage = `EXECUTE THIS COMMAND NOW using the bash tool:
+
+\`\`\`bash
+${directCommand.command}
+\`\`\`
+
+Purpose: ${directCommand.description}
+
+Original request: ${userMessage}
+
+INSTRUCTION: Call the bash tool with exactly this command. Show the real output. Do not explain - just run it.`;
+        console.log(`[Skill] Direct command match: ${directCommand.command}`);
+      } else {
+        // No direct match - inject full skill for complex queries
+        try {
+          const skillContent = readFileSync(matchedSkill.path, 'utf-8');
+          userMessage = `## SKILL INSTRUCTIONS (${matchedSkill.name})
+${skillContent}
+
+## YOUR TASK
+${userMessage}
+
+IMPORTANT: Use the bash tool to EXECUTE the commands from the skill above. Do NOT just explain or show code - actually RUN the commands and show the real output.`;
+          console.log(`[Skill] Auto-injected full skill: ${matchedSkill.name}`);
+        } catch (e) {
+          console.error(`[Skill] Failed to load ${matchedSkill.path}:`, e);
+        }
+      }
+    }
 
     // Send typing indicator
     await ctx.sendChatAction('typing');
 
     // Send initial "thinking" message
-    const thinkingMsg = await ctx.reply('💭 Thinking...');
+    let thinkingText = '💭 Thinking...';
+    if (directCommand) {
+      thinkingText = `⚡ Running: \`${directCommand.command.slice(0, 50)}...\``;
+    } else if (matchedSkill) {
+      thinkingText = `🔧 Using skill: ${matchedSkill.name}...`;
+    }
+    const thinkingMsg = await ctx.reply(thinkingText, { parse_mode: 'Markdown' });
     let lastContent = '';
     let lastUpdate = Date.now();
     let toolInfo = '';

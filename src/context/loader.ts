@@ -177,6 +177,17 @@ export function buildSystemPrompt(context: LoadedContext, toolsSummary: string):
   // Tools section
   sections.push(`\n## Available Tools\n${toolsSummary}`);
 
+  // Tool usage guidelines - critical instructions
+  sections.push(`\n## CRITICAL: Tool Usage Rules
+IMPORTANT: You MUST follow these rules:
+1. NEVER call any tool for greetings like "hello", "hi", "hey" - just respond conversationally
+2. NEVER call any tool for questions like "what can you do?" or "how are you?" - just answer directly
+3. NEVER call memory_search unless the user explicitly says "remember", "recall", "what did we discuss", or similar
+4. NEVER call web_search for general questions you can answer from your knowledge
+5. ONLY use tools when the user explicitly requests an action that requires a tool (run a command, read a file, search the web for current info, etc.)
+
+If in doubt, respond WITHOUT using tools first.`);
+
   // Tool notes from context
   if (context.tools) {
     sections.push('\n## Tool Notes\n' + extractContent(context.tools.content));

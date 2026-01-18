@@ -120,7 +120,7 @@ function extractTextFromHtml(html: string): string {
  */
 export const webSearchTool = defineTool({
   name: 'web_search',
-  description: 'Search the web using DuckDuckGo and return relevant results. Use this to find current information, documentation, or answers to questions.',
+  description: 'Search the web for current/recent information. ONLY use when user explicitly asks to search the web, or needs real-time data (news, prices, weather, events). Do NOT use for general questions you can answer yourself.',
   parameters: {
     query: {
       type: 'string',

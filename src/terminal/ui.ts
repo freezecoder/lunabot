@@ -9,7 +9,10 @@ import { OllamaProvider } from '../agent/providers/ollama.js';
 import { ToolRegistry } from '../tools/registry.js';
 import { getAllBuiltInTools } from '../tools/built-in/index.js';
 import { loadSkillsFromDirectory } from '../tools/skill-loader.js';
+import { loadSkillsFromDirectory as loadMdSkills } from '../skills/loader.js';
+import type { SkillEntry } from '../skills/types.js';
 import { loadContext, buildSystemPrompt, getContextSummary, type LoadedContext } from '../context/loader.js';
+import { readFileSync } from 'fs';
 import { MODEL_CAPABILITIES } from '../router/router.js';
 import { mcpManager, loadMcpConfig, type McpServerConfig } from '../mcp/client.js';
 import { globalMetrics } from '../tracking/metrics.js';
@@ -32,6 +35,11 @@ let registry: ToolRegistry;
 let context: LoadedContext;
 let sessionId = `terminal-${Date.now()}`;
 let showTools = true;
+
+// Skill state
+let promptSkills: SkillEntry[] = [];
+let activeSkill: SkillEntry | null = null;
+let activeSkillContent: string | null = null;
 
 // Colors
 const colors = {
@@ -87,6 +95,11 @@ function printHeader() {
     console.log(colors.info(`  Context: ${colors.identity(getContextSummary(context))}`));
   }
 
+  if (promptSkills.length > 0) {
+    const activeInfo = activeSkill ? colors.success(` [active: ${activeSkill.name}]`) : '';
+    console.log(colors.info(`  Skills: ${promptSkills.length} available${activeInfo}`));
+  }
+
   // Show token usage if available
   const sessionStats = globalTokenTracker.getSessionStats(sessionId);
   if (sessionStats && sessionStats.totalTokens > 0) {
@@ -109,6 +122,8 @@ ${chalk.bold('Commands:')}
   ${colors.command('/model')}     - Switch model (e.g., /model llama3.1:8b)
   ${colors.command('/models')}    - List available models
   ${colors.command('/tools')}     - List available tools
+  ${colors.command('/skill')}     - Set active skill (e.g., /skill genomics-jobs)
+  ${colors.command('/skills')}    - List available skills
   ${colors.command('/tokens')}    - Show token usage statistics
   ${colors.command('/mcp')}       - Show MCP servers and tools
   ${colors.command('/context')}   - Show loaded context files
@@ -122,8 +137,8 @@ ${chalk.bold('Tips:')}
   • The assistant knows your context from ${CONTEXT_DIR}
   • Tool calls shown in ${colors.tool('yellow')}
   • Token usage: ↓ = input, ↑ = output, ctx = context window %
-  • Use /context to see loaded personality files
-  • Use /mcp to see connected MCP servers
+  • Use /skill <name> to load a skill context (e.g., /skill genomics-jobs)
+  • Use /skill off to disable active skill
 `);
 }
 
@@ -264,6 +279,68 @@ function listTools() {
 }
 
 /**
+ * List available skills
+ */
+function listSkills() {
+  console.log(`\n${chalk.bold('Available Skills:')} (${promptSkills.length})\n`);
+
+  if (promptSkills.length === 0) {
+    console.log(colors.info('  No skills loaded.'));
+    console.log(colors.info(`  Add SKILL.md files to ${CONTEXT_DIR}/skills/`));
+    console.log();
+    return;
+  }
+
+  for (const skill of promptSkills) {
+    const isActive = activeSkill?.name === skill.name;
+    const status = isActive ? colors.success(' ← active') : '';
+    console.log(`  ${colors.tool('•')} ${chalk.bold(skill.name)}${status}`);
+    console.log(`    ${colors.info(skill.description.slice(0, 70))}...`);
+    console.log(`    ${colors.info(`Source: ${skill.source}`)}`);
+  }
+  console.log();
+
+  if (activeSkill) {
+    console.log(colors.info(`  Active skill: ${colors.success(activeSkill.name)}`));
+    console.log(colors.info(`  Use /skill off to disable`));
+    console.log();
+  }
+}
+
+/**
+ * Set active skill
+ */
+function setSkill(skillName: string) {
+  if (skillName === 'off' || skillName === 'none' || skillName === 'clear') {
+    activeSkill = null;
+    activeSkillContent = null;
+    console.log(colors.success('\n✓ Skill disabled. Using normal mode.\n'));
+    return;
+  }
+
+  const skill = promptSkills.find(s =>
+    s.name.toLowerCase() === skillName.toLowerCase() ||
+    s.name.toLowerCase().includes(skillName.toLowerCase())
+  );
+
+  if (!skill) {
+    console.log(colors.error(`\nSkill "${skillName}" not found.`));
+    console.log(colors.info('Use /skills to see available skills.\n'));
+    return;
+  }
+
+  try {
+    activeSkillContent = readFileSync(skill.path, 'utf-8');
+    activeSkill = skill;
+    console.log(colors.success(`\n✓ Active skill: ${colors.model(skill.name)}`));
+    console.log(colors.info(`  All messages will be processed with this skill context.`));
+    console.log(colors.info(`  Use /skill off to disable.\n`));
+  } catch (e) {
+    console.log(colors.error(`\nFailed to load skill from ${skill.path}\n`));
+  }
+}
+
+/**
  * Show MCP servers and their tools
  */
 function showMcp() {
@@ -389,6 +466,22 @@ async function processInput(input: string, rl: readline.Interface) {
       case 'tools':
         listTools();
         return;
+      case 'skill':
+        if (args[0]) {
+          setSkill(args.join(' '));
+        } else {
+          if (activeSkill) {
+            console.log(colors.info(`\nActive skill: ${colors.success(activeSkill.name)}`));
+            console.log(colors.info('Use /skill off to disable, or /skill <name> to switch.'));
+          } else {
+            console.log(colors.info('\nNo active skill. Use /skill <name> to set one.'));
+          }
+          console.log(colors.info('Use /skills to see available skills.\n'));
+        }
+        return;
+      case 'skills':
+        listSkills();
+        return;
       case 'tokens':
         showTokens();
         return;
@@ -425,6 +518,20 @@ async function processInput(input: string, rl: readline.Interface) {
 
   if (!trimmed) return;
 
+  // Inject skill content if active
+  let messageToSend = trimmed;
+  if (activeSkill && activeSkillContent) {
+    messageToSend = `## SKILL CONTEXT: ${activeSkill.name}
+
+${activeSkillContent}
+
+## USER REQUEST
+${trimmed}
+
+IMPORTANT: Use the bash tool to execute any commands from the skill instructions. Show real output, don't just explain.`;
+    console.log(colors.info(`  [Using skill: ${activeSkill.name}]\n`));
+  }
+
   // Process message
   console.log();
   process.stdout.write(colors.assistant('Assistant: '));
@@ -434,7 +541,7 @@ async function processInput(input: string, rl: readline.Interface) {
   let lastTokenUsage: { input: number; output: number; total: number } | undefined;
 
   try {
-    for await (const event of agent.runStream(trimmed, sessionId)) {
+    for await (const event of agent.runStream(messageToSend, sessionId)) {
       switch (event.type) {
         case 'content':
           if (event.content) {
@@ -511,13 +618,25 @@ async function main() {
   registry = new ToolRegistry();
   registry.registerAll(getAllBuiltInTools());
 
-  // Load skills from multiple directories
+  // Load tool skills (YAML/JSON) from multiple directories
   for (const skillsPath of [SKILLS_DIR, `${AGENT_DIR}/skills`]) {
     try {
       const skills = await loadSkillsFromDirectory(skillsPath);
       if (skills.length > 0) {
         registry.registerAll(skills);
-        console.log(`Loaded ${skills.length} skills from ${skillsPath}`);
+        console.log(`Loaded ${skills.length} tool skills from ${skillsPath}`);
+      }
+    } catch {}
+  }
+
+  // Load prompt skills (MD files with SKILL.md pattern)
+  const mdSkillsDirs = [`${CONTEXT_DIR}/skills`, `${AGENT_DIR}/skills`, SKILLS_DIR];
+  for (const skillsPath of mdSkillsDirs) {
+    try {
+      const skills = await loadMdSkills(skillsPath, 'workspace');
+      if (skills.length > 0) {
+        promptSkills.push(...skills);
+        console.log(`Loaded ${skills.length} prompt skills from ${skillsPath}`);
       }
     } catch {}
   }

@@ -10,7 +10,7 @@ import { getMemoryManager } from '../../memory/manager.js';
  */
 export const memorySearchTool: Tool = {
   name: 'memory_search',
-  description: 'Search memory for relevant information using semantic similarity. Use this to recall past conversations, notes, or stored knowledge.',
+  description: 'RESTRICTED: Only call this when user explicitly says "remember", "recall", "what did we discuss", or asks about past conversations. NEVER use for greetings, hello, hi, general questions, or anything else.',
   parameters: {
     type: 'object',
     properties: {

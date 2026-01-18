@@ -22,10 +22,10 @@ import { memoryTools } from './memory.js';
 import type { Tool } from '../../types.js';
 
 /**
- * Get all built-in tools
+ * Get default tools (excludes memory - opt-in via LOCALBOT_ENABLE_MEMORY=true)
  */
 export function getAllBuiltInTools(): Tool[] {
-  return [
+  const tools = [
     bashTool,
     ...fileTools,
     ...webTools,
@@ -33,8 +33,14 @@ export function getAllBuiltInTools(): Tool[] {
     ...gogTools,
     ...apiTools,
     ...documentTools,
-    ...memoryTools,
   ];
+
+  // Only include memory tools if explicitly enabled
+  if (process.env.LOCALBOT_ENABLE_MEMORY === 'true') {
+    tools.push(...memoryTools);
+  }
+
+  return tools;
 }
 
 /**

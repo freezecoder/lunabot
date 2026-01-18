@@ -55,6 +55,16 @@ export class ModelRouter {
 
     // Analyze the user message to determine routing
     const userMessage = lastMessage?.role === 'user' ? lastMessage.content : '';
+
+    // Check if this is a simple conversational message (no tools needed)
+    if (this.isSimpleConversation(userMessage)) {
+      return {
+        model: this.config.reasoningModel,
+        reason: 'Simple conversation - no tools',
+        useTools: false,
+      };
+    }
+
     const needsTools = this.analyzeForToolNeed(userMessage, availableTools);
 
     if (needsTools) {
@@ -66,12 +76,53 @@ export class ModelRouter {
       };
     }
 
-    // Default to reasoning model
+    // Default to reasoning model with tools available
     return {
       model: this.config.reasoningModel,
-      reason: 'General reasoning task',
+      reason: 'General task with tools available',
       useTools: availableTools.length > 0,
     };
+  }
+
+  /**
+   * Check if message is simple conversation that doesn't need tools
+   */
+  private isSimpleConversation(message: string): boolean {
+    const lowerMsg = message.toLowerCase().trim();
+
+    // Very short messages are usually conversational
+    if (lowerMsg.length < 20) {
+      // Greetings
+      const greetings = ['hi', 'hello', 'hey', 'yo', 'sup', 'howdy', 'hola', 'hii', 'hiiii'];
+      if (greetings.some(g => lowerMsg === g || lowerMsg.startsWith(g + ' ') || lowerMsg.startsWith(g + '!'))) {
+        return true;
+      }
+    }
+
+    // Common conversational patterns
+    const conversationalPatterns = [
+      /^(hi|hello|hey|yo|sup|howdy|hola)[\s!.,]*$/i,
+      /^how are you/i,
+      /^what('s| is) up/i,
+      /^good (morning|afternoon|evening|night)/i,
+      /^thanks?( you)?[\s!.,]*$/i,
+      /^thank you/i,
+      /^ok(ay)?[\s!.,]*$/i,
+      /^(yes|no|yeah|nope|yep|nah)[\s!.,]*$/i,
+      /^what can you do/i,
+      /^who are you/i,
+      /^what are you/i,
+      /^tell me about yourself/i,
+      /^introduce yourself/i,
+    ];
+
+    for (const pattern of conversationalPatterns) {
+      if (pattern.test(lowerMsg)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /**

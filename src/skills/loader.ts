@@ -160,13 +160,34 @@ export async function loadSkillsFromDirectory(
     const entries = await readdir(dirPath, { withFileTypes: true });
 
     for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+      const fullPath = join(dirPath, entry.name);
 
-      const filePath = join(dirPath, entry.name);
-      const skill = await loadSkillFile(filePath, source);
+      // Check for direct .md files
+      if (entry.isFile() && entry.name.endsWith('.md')) {
+        const skill = await loadSkillFile(fullPath, source);
+        if (skill) {
+          skills.push(skill);
+        }
+      }
 
-      if (skill) {
-        skills.push(skill);
+      // Check subdirectories for SKILL.md pattern (skill-name/SKILL.md)
+      if (entry.isDirectory()) {
+        const skillMdPath = join(fullPath, 'SKILL.md');
+        if (await directoryExists(skillMdPath.replace('/SKILL.md', ''))) {
+          try {
+            await access(skillMdPath, constants.R_OK);
+            const skill = await loadSkillFile(skillMdPath, source);
+            if (skill) {
+              // Use directory name as skill name if not in frontmatter
+              if (!skill.name || skill.name === 'SKILL') {
+                skill.name = entry.name;
+              }
+              skills.push(skill);
+            }
+          } catch {
+            // SKILL.md doesn't exist in this subdirectory
+          }
+        }
       }
     }
   } catch (error) {
