@@ -1,0 +1,31 @@
+# Sample Skills for LocalBot
+version: '1.0'
+
+skills:
+  - name: system_info
+    description: Get system information including OS, CPU, and memory
+    command: |
+      echo "=== System Info ===" && uname -a && echo "" && echo "=== Memory ===" && vm_stat 2>/dev/null || free -h
+    timeout: 10000
+
+  - name: weather
+    description: Get current weather for a city
+    parameters:
+      city:
+        type: string
+        description: City name
+        required: true
+    http:
+      url: "https://wttr.in/{{city}}?format=3"
+      method: GET
+    timeout: 10000
+
+  - name: disk_usage
+    description: Check disk usage for all mounted volumes
+    command: df -h
+    timeout: 5000
+
+  - name: top_processes
+    description: List top 10 processes by CPU usage
+    command: ps aux | head -1 && ps aux | sort -nrk 3,3 | head -10
+    timeout: 5000

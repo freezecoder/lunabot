@@ -1,0 +1,5 @@
+NAME                   ID              SIZE      MODIFIED     
+gpt-oss:120b           a951a23b46a1    65 GB     18 hours ago    
+qwen2.5:32b            9f13ba1299af    19 GB     20 hours ago    
+deepseek-r1:14b        c333b7232bdb    9.0 GB    20 hours ago    
+deepseek-v3.2:cloud    55f7c48fb187    -         20 hours ago    

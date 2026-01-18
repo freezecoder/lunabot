@@ -1,0 +1,154 @@
+# Model Configuration for LocalBot
+# Define model capabilities and routing rules
+
+version: '1.0'
+
+# Default models for different tasks
+defaults:
+  reasoning: llama3.1:8b
+  tool_calling: llama3.1:8b
+  planning: llama3.1:8b
+  fallback: llama3.1:8b
+
+# Model definitions with capabilities
+models:
+  # Llama 3.1 family - native tool support
+  llama3.1:8b:
+    supports_tools: true
+    context_window: 128000
+    description: Fast, efficient, native tool calling
+    use_for:
+      - quick_responses
+      - tool_calling
+      - general_chat
+
+  llama3.1:70b:
+    supports_tools: true
+    context_window: 128000
+    description: High quality, native tool calling
+    use_for:
+      - complex_reasoning
+      - tool_calling
+      - code_generation
+
+  # Llama 3.2 family
+  llama3.2:3b:
+    supports_tools: true
+    context_window: 128000
+    description: Compact, fast, tool support
+    use_for:
+      - quick_responses
+      - mobile
+
+  # Qwen 2.5 family - good tool support
+  qwen2.5:7b:
+    supports_tools: true
+    context_window: 32768
+    description: Fast, reliable tool calling
+    use_for:
+      - tool_calling
+      - code_generation
+
+  qwen2.5:32b:
+    supports_tools: true
+    context_window: 32768
+    description: High quality, good for complex tasks
+    use_for:
+      - complex_reasoning
+      - tool_calling
+
+  qwen2.5:72b:
+    supports_tools: true
+    context_window: 32768
+    description: Best quality Qwen model
+    use_for:
+      - complex_reasoning
+      - code_generation
+
+  # DeepSeek models - reasoning focused
+  deepseek-r1:14b:
+    supports_tools: false
+    context_window: 64000
+    description: Strong reasoning with CoT
+    use_for:
+      - reasoning
+      - analysis
+      - planning
+
+  deepseek-r1:32b:
+    supports_tools: false
+    context_window: 64000
+    description: Stronger reasoning, slower
+    use_for:
+      - complex_reasoning
+      - analysis
+
+  # Mistral family
+  mistral:7b:
+    supports_tools: true
+    context_window: 32768
+    description: Fast, efficient
+    use_for:
+      - quick_responses
+      - general_chat
+
+  mixtral:8x7b:
+    supports_tools: true
+    context_window: 32768
+    description: MoE architecture, good quality
+    use_for:
+      - general_chat
+      - code_generation
+
+# Routing rules
+routing:
+  # Task-based routing
+  tasks:
+    reasoning:
+      primary: deepseek-r1:14b
+      fallback: llama3.1:70b
+
+    tool_calling:
+      primary: llama3.1:8b
+      fallback: qwen2.5:7b
+
+    code:
+      primary: qwen2.5:32b
+      fallback: llama3.1:70b
+
+    quick:
+      primary: llama3.2:3b
+      fallback: llama3.1:8b
+
+  # Keyword triggers for model selection
+  keywords:
+    think:
+      - "think"
+      - "reason"
+      - "analyze"
+      - "explain why"
+      model: deepseek-r1:14b
+
+    code:
+      - "code"
+      - "program"
+      - "function"
+      - "script"
+      model: qwen2.5:32b
+
+    quick:
+      - "quick"
+      - "fast"
+      - "simple"
+      model: llama3.2:3b
+
+# Ollama endpoints
+endpoints:
+  local:
+    host: http://localhost:11434
+    priority: 1
+
+  tailscale:
+    host: http://100.121.61.16:11434
+    priority: 2
+    description: Tailscale edge server

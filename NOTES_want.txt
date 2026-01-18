@@ -1,0 +1,4 @@
+is it possible to test in terminal ui (tui) if no telegram available. I think it will be important to have noninteractie bash or node scripts that can test function calls, model loading, chat response,         
+  queries about skills ,memories , etc. Since we are trying to build an improved clawdbot.
+
+

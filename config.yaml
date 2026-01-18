@@ -1,0 +1,47 @@
+model_list:
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: ollama/qwen2.5:32b
+      api_base: http://100.121.61.16:11434
+      drop_params: true
+    model_info:
+      supports_function_calling: true
+
+  - model_name: claude-sonnet-4-5
+    litellm_params:
+      model: ollama/gpt-oss:120b
+      api_base: http://100.121.61.16:11434
+      drop_params: true
+    model_info:
+      supports_function_calling: false
+
+  - model_name: claude-opus-4-5
+    litellm_params:
+      model: ollama/gpt-oss:120b
+      api_base: http://100.121.61.16:11434
+      drop_params: true
+    model_info:
+      supports_function_calling: false
+
+  - model_name: deepseek-r1
+    litellm_params:
+      model: ollama/deepseek-r1:14b
+      api_base: http://100.121.61.16:11434
+      drop_params: true
+    model_info:
+      supports_function_calling: false
+
+  - model_name: deepseek-v3
+    litellm_params:
+      model: ollama/deepseek-v3.2:cloud
+      api_base: http://100.121.61.16:11434
+      drop_params: true
+    model_info:
+      supports_function_calling: false
+
+general_settings:
+  master_key: sk-litellm-local
+  drop_params: true
+
+litellm_settings:
+  drop_params: true
