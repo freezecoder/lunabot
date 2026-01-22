@@ -13,7 +13,7 @@ import {
   type SkillSourceConfig,
   DEFAULT_SKILL_METADATA,
 } from './types.js';
-import { getSkillsDirs, getLocalbotHome } from '../config/paths.js';
+import { getSkillsDirs, getLocalbotHome, getClaudeSkillsDir, isClaudeSkillsEnabled } from '../config/paths.js';
 
 /**
  * Check if directory exists and is readable
@@ -119,7 +119,8 @@ function extractDescription(body: string): string {
  */
 async function loadSkillFile(
   path: string,
-  source: SkillEntry['source']
+  source: SkillEntry['source'],
+  readOnly: boolean = false
 ): Promise<SkillEntry | null> {
   try {
     const content = await readFile(path, 'utf-8');
@@ -136,6 +137,7 @@ async function loadSkillFile(
       path,
       source,
       metadata: parsed.metadata,
+      readOnly,
     };
   } catch (error) {
     console.warn(`Failed to load skill from ${path}:`, error);
@@ -148,7 +150,8 @@ async function loadSkillFile(
  */
 export async function loadSkillsFromDirectory(
   dirPath: string,
-  source: SkillEntry['source'] = 'workspace'
+  source: SkillEntry['source'] = 'workspace',
+  readOnly: boolean = false
 ): Promise<SkillEntry[]> {
   const skills: SkillEntry[] = [];
 
@@ -164,7 +167,7 @@ export async function loadSkillsFromDirectory(
 
       // Check for direct .md files
       if (entry.isFile() && entry.name.endsWith('.md')) {
-        const skill = await loadSkillFile(fullPath, source);
+        const skill = await loadSkillFile(fullPath, source, readOnly);
         if (skill) {
           skills.push(skill);
         }
@@ -176,7 +179,7 @@ export async function loadSkillsFromDirectory(
         if (await directoryExists(skillMdPath.replace('/SKILL.md', ''))) {
           try {
             await access(skillMdPath, constants.R_OK);
-            const skill = await loadSkillFile(skillMdPath, source);
+            const skill = await loadSkillFile(skillMdPath, source, readOnly);
             if (skill) {
               // Use directory name as skill name if not in frontmatter
               if (!skill.name || skill.name === 'SKILL') {
@@ -202,9 +205,10 @@ export async function loadSkillsFromDirectory(
  *
  * Order (lowest to highest priority):
  * 1. Extra directories (user-configured)
- * 2. Bundled skills (~/.localbot/skills-bundled/)
- * 3. Managed skills (~/.localbot/skills/)
- * 4. Workspace skills (./skills/)
+ * 2. Claude Code skills (~/.claude/skills) - READ-ONLY
+ * 3. Bundled skills (~/.localbot/skills-bundled/)
+ * 4. Managed skills (~/.localbot/skills/)
+ * 5. Workspace skills (./skills/)
  */
 export async function loadSkillsWithPrecedence(
   workspaceSkillsDir?: string
@@ -223,6 +227,7 @@ export async function loadSkillsWithPrecedence(
         path,
         source: 'extra' as const,
         priority: i,
+        readOnly: false,
       })
     ),
     // Bundled skills
@@ -230,24 +235,39 @@ export async function loadSkillsWithPrecedence(
       path: join(localbotHome, 'skills-bundled'),
       source: 'bundled' as const,
       priority: 50,
+      readOnly: false,
     },
     // Managed skills
     {
       path: join(localbotHome, 'skills'),
       source: 'managed' as const,
       priority: 100,
+      readOnly: false,
     },
     // Workspace skills (highest priority)
     {
       path: workspaceSkillsDir || './skills',
       source: 'workspace' as const,
       priority: 200,
+      readOnly: false,
     },
   ];
 
+  // Add Claude Code skills if enabled (read-only, between extra and bundled)
+  if (isClaudeSkillsEnabled()) {
+    const claudeSkillsDir = getClaudeSkillsDir();
+    sources.push({
+      path: claudeSkillsDir,
+      source: 'claude' as const,
+      priority: 25,  // After extra, before bundled
+      readOnly: true,  // Claude skills are read-only
+    });
+    console.log(`[Skills] Claude skills enabled: ${claudeSkillsDir}`);
+  }
+
   // Load skills in order, letting higher priority override
   for (const config of sources.sort((a, b) => a.priority - b.priority)) {
-    const skills = await loadSkillsFromDirectory(config.path, config.source);
+    const skills = await loadSkillsFromDirectory(config.path, config.source, config.readOnly);
 
     for (const skill of skills) {
       skillMap.set(skill.name.toLowerCase(), skill);
@@ -255,6 +275,17 @@ export async function loadSkillsWithPrecedence(
   }
 
   return Array.from(skillMap.values());
+}
+
+/**
+ * Load Claude Code skills only
+ * Returns skills marked as read-only
+ */
+export async function loadClaudeSkills(): Promise<SkillEntry[]> {
+  if (!isClaudeSkillsEnabled()) {
+    return [];
+  }
+  return loadSkillsFromDirectory(getClaudeSkillsDir(), 'claude', true);
 }
 
 /**

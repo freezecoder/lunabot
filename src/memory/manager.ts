@@ -14,6 +14,28 @@ import type {
   DEFAULT_MEMORY_CONFIG,
 } from './types.js';
 import { getMemoryDir, getAgentDir } from '../config/paths.js';
+import { createLogger, type Logger } from '../db/index.js';
+import type { Channel } from '../db/types.js';
+
+// Module-level logger for memory operations
+let memoryLogger: Logger | null = null;
+
+/**
+ * Set the channel for memory logging
+ */
+export function setMemoryLoggerChannel(channel: Channel): void {
+  memoryLogger = createLogger(channel);
+}
+
+/**
+ * Get the memory logger (creates with 'system' channel if not set)
+ */
+function getLogger(): Logger {
+  if (!memoryLogger) {
+    memoryLogger = createLogger('system');
+  }
+  return memoryLogger;
+}
 
 /**
  * Memory Manager class
@@ -99,11 +121,17 @@ export class MemoryManager {
     const queryEmbedding = await generateEmbedding(query, this.config.embedding.model);
 
     // Search by embedding similarity
-    return this.store.searchByEmbedding(
+    const results = this.store.searchByEmbedding(
       queryEmbedding,
       maxResults || this.config.query.maxResults,
       this.config.query.minScore
     );
+
+    // Log the search
+    const logger = getLogger();
+    logger.memorySearch(query, results.length);
+
+    return results;
   }
 
   /**
@@ -121,7 +149,13 @@ export class MemoryManager {
   async sync(): Promise<{ files: number; chunks: number }> {
     await this.ensureInit();
 
-    return this.indexer.syncWorkspace(this.workspaceDir);
+    const result = await this.indexer.syncWorkspace(this.workspaceDir);
+
+    // Log the sync
+    const logger = getLogger();
+    logger.memorySync(result.files, result.chunks);
+
+    return result;
   }
 
   /**
@@ -172,6 +206,10 @@ export class MemoryManager {
 
     // Re-index the file
     await this.indexer.indexFile(filePath, { force: true });
+
+    // Log the flush
+    const logger = getLogger();
+    logger.info('memory.flush', `Flushed content to ${filePath}`, { filePath, contentLength: content.length });
 
     return filePath;
   }

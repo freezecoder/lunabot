@@ -119,6 +119,8 @@ export class OllamaProvider extends BaseProvider {
   }
 
   async *chatStream(request: ChatRequest): AsyncIterable<StreamChunk> {
+    console.log(`[OllamaProvider] chatStream: model=${request.model}, hasTools=${!!request.tools}, toolCount=${request.tools?.length || 0}`);
+
     const response = await this.client.chat({
       model: request.model,
       messages: this.toOllamaMessages(request.messages) as Parameters<Ollama['chat']>[0]['messages'],
@@ -135,6 +137,7 @@ export class OllamaProvider extends BaseProvider {
     for await (const chunk of response) {
       // Check for tool calls in the chunk
       if (chunk.message.tool_calls && chunk.message.tool_calls.length > 0) {
+        console.log(`[OllamaProvider] Received tool_calls from Ollama:`, JSON.stringify(chunk.message.tool_calls));
         const newToolCalls = this.extractToolCalls(chunk.message);
         if (newToolCalls) {
           accumulatedToolCalls = newToolCalls;
@@ -151,6 +154,8 @@ export class OllamaProvider extends BaseProvider {
         total_duration: chunk.total_duration,
       };
     }
+
+    console.log(`[OllamaProvider] Stream complete. Total tool calls: ${accumulatedToolCalls.length}`);
   }
 
   async listModels(): Promise<string[]> {

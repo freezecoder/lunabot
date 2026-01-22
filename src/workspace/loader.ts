@@ -13,6 +13,28 @@ import {
   parseUserInfo,
 } from './types.js';
 import { getGlobalContextDir, getAgentDir } from '../config/paths.js';
+import { createLogger, type Logger } from '../db/index.js';
+import type { WorkspaceFileInfo, Channel } from '../db/types.js';
+
+// Module-level logger for workspace operations
+let workspaceLogger: Logger | null = null;
+
+/**
+ * Set the channel for workspace logging
+ */
+export function setWorkspaceLoggerChannel(channel: Channel): void {
+  workspaceLogger = createLogger(channel);
+}
+
+/**
+ * Get the workspace logger (creates with 'system' channel if not set)
+ */
+function getLogger(): Logger {
+  if (!workspaceLogger) {
+    workspaceLogger = createLogger('system');
+  }
+  return workspaceLogger;
+}
 
 /**
  * Check if a file exists
@@ -185,6 +207,16 @@ export async function loadWorkspaceBootstrapFiles(
   if (userFile) {
     context.userInfo = parseUserInfo(userFile.content);
   }
+
+  // Log workspace files loaded
+  const logger = getLogger();
+  const fileInfos: WorkspaceFileInfo[] = files.map(f => ({
+    name: f.name,
+    path: f.path,
+    loaded: !f.missing,
+    source: f.source,
+  }));
+  logger.workspaceLoaded(fileInfos);
 
   return context;
 }

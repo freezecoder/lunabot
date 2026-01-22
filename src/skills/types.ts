@@ -27,8 +27,10 @@ export interface SkillEntry {
   description: string;
   content: string;
   path: string;
-  source: 'bundled' | 'managed' | 'workspace' | 'extra';
+  source: 'bundled' | 'managed' | 'workspace' | 'extra' | 'claude';
   metadata?: SkillMetadata;
+  /** If true, this skill should not be modified by the bot */
+  readOnly?: boolean;
 }
 
 /**
@@ -38,6 +40,8 @@ export interface SkillSourceConfig {
   path: string;
   source: SkillEntry['source'];
   priority: number;  // Higher = loaded later = overrides
+  /** If true, skills from this source should not be modified */
+  readOnly?: boolean;
 }
 
 /**

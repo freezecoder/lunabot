@@ -5,17 +5,35 @@
 
 import { Telegraf, Context, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
+import { join } from 'path';
 import { Agent, StreamEvent } from '../agent/agent.js';
 import { OllamaProvider } from '../agent/providers/ollama.js';
 import { ToolRegistry } from '../tools/registry.js';
-import { getAllBuiltInTools } from '../tools/built-in/index.js';
+import { getAllBuiltInTools, setReminderTelegramChatId } from '../tools/built-in/index.js';
 import { loadSkillsFromDirectory } from '../tools/skill-loader.js';
 import { loadSkillsFromDirectory as loadMdSkills } from '../skills/loader.js';
+import { getImportedSkillsPath } from '../skills/claude-importer.js';
 import { SessionManager } from './session/manager.js';
+import { getTelegramTools, setTelegramContext } from './tools.js';
+import {
+  handleDocument,
+  handlePhoto,
+  handleVoice,
+  handleAudio,
+  handleVideo,
+  formatAttachmentInfo,
+  getTextFilePreview,
+  type AttachmentInfo,
+} from './attachments.js';
 import { MODEL_CAPABILITIES } from '../router/router.js';
 import { loadContext, buildSystemPrompt } from '../context/loader.js';
+import { getSystemStats, getOllamaStats, formatBytes, formatUptime, getCompactStatus } from '../utils/system-monitor.js';
+import { logActivity } from '../utils/activity-tracker.js';
+import { CronScheduler, type DeliveryHandler } from '../cron/scheduler.js';
+import type { CronJob, DeliveryChannel } from '../cron/types.js';
 import type { SkillEntry } from '../skills/types.js';
+import { getProjectManager, type ProjectManager, type ProjectSummary } from '../project/index.js';
 import 'dotenv/config';
 
 // Configuration
@@ -26,8 +44,13 @@ const REASONING_MODEL = process.env.REASONING_MODEL || 'qwen2.5:32b';  // Smarte
 const TOOL_MODEL = process.env.TOOL_MODEL || DEFAULT_MODEL;            // Faster model for tool execution
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(Number).filter(Boolean);
 const SKILLS_DIR = process.env.SKILLS_DIR || './skills';
-const CONTEXT_DIR = process.env.CONTEXT_DIR || '/Users/zayed/clawd';
-const AGENT_DIR = process.env.AGENT_DIR || './agent';
+
+// These will be set by project manager
+let CONTEXT_DIR = process.env.CONTEXT_DIR || '/Users/zayed/clawd';
+let AGENT_DIR = process.env.AGENT_DIR || './agent';
+
+// Project manager
+let projectManager: ProjectManager;
 
 // Initialize components
 const provider = new OllamaProvider({ host: OLLAMA_HOST });
@@ -37,11 +60,21 @@ const sessions = new SessionManager({ defaultModel: DEFAULT_MODEL });
 // Register built-in tools
 registry.registerAll(getAllBuiltInTools());
 
+// Register Telegram-specific tools (send files, images, etc.)
+registry.registerAll(getTelegramTools());
+console.log(`Registered ${getTelegramTools().length} Telegram-specific tools`);
+
 // Agent will be initialized after async skill loading
 let agent: Agent;
 
 // Prompt skills for auto-injection
 let promptSkills: SkillEntry[] = [];
+
+// Cron scheduler for reminders
+let cronScheduler: CronScheduler | null = null;
+
+// Store Telegram API reference for reminder delivery
+let telegramApi: Telegraf['telegram'] | null = null;
 
 // Message update throttle (avoid rate limits)
 const UPDATE_INTERVAL = 1000; // 1 second
@@ -170,19 +203,48 @@ function findDirectCommand(message: string, skillName: string): { command: strin
 
 /**
  * Match a message to a skill based on keywords
+ * Checks both hardcoded SKILL_KEYWORDS and skill metadata triggers
+ * Returns highest priority skill that matches
  */
 function matchSkillByKeywords(message: string, skills: SkillEntry[]): SkillEntry | null {
   const lower = message.toLowerCase();
+  const matches: Array<{ skill: SkillEntry; priority: number }> = [];
 
   for (const skill of skills) {
-    const keywords = SKILL_KEYWORDS[skill.name] || [];
-    for (const keyword of keywords) {
+    let matched = false;
+
+    // Check hardcoded keywords first (for backward compatibility)
+    const hardcodedKeywords = SKILL_KEYWORDS[skill.name] || [];
+    for (const keyword of hardcodedKeywords) {
       if (lower.includes(keyword)) {
-        return skill;
+        matched = true;
+        break;
       }
     }
+
+    // Check skill metadata triggers (from YAML frontmatter)
+    if (!matched) {
+      const metadataTriggers = skill.metadata?.triggers || [];
+      for (const trigger of metadataTriggers) {
+        if (lower.includes(trigger.toLowerCase())) {
+          matched = true;
+          break;
+        }
+      }
+    }
+
+    if (matched) {
+      const priority = skill.metadata?.priority ?? 0;
+      matches.push({ skill, priority });
+    }
   }
-  return null;
+
+  if (matches.length === 0) return null;
+
+  // Sort by priority (highest first) and return the best match
+  matches.sort((a, b) => b.priority - a.priority);
+  console.log(`[Skill] Matched ${matches.length} skill(s), using: ${matches[0].skill.name} (priority: ${matches[0].priority})`);
+  return matches[0].skill;
 }
 
 /**
@@ -204,11 +266,55 @@ function buildSkillsPromptSection(skills: SkillEntry[]): string {
 }
 
 /**
+ * Load today's and yesterday's memory files (clawdbot-style)
+ */
+function loadDailyMemory(): string {
+  const memoryDir = join(CONTEXT_DIR, 'memory');
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  const formatDate = (d: Date) => d.toISOString().split('T')[0];
+  const todayFile = join(memoryDir, `${formatDate(today)}.md`);
+  const yesterdayFile = join(memoryDir, `${formatDate(yesterday)}.md`);
+
+  let memoryContent = '';
+
+  // Load yesterday first if exists
+  if (existsSync(yesterdayFile)) {
+    try {
+      const content = readFileSync(yesterdayFile, 'utf-8');
+      memoryContent += `## Yesterday's Memory (${formatDate(yesterday)})\n\n${content}\n\n`;
+    } catch {}
+  }
+
+  // Load today if exists
+  if (existsSync(todayFile)) {
+    try {
+      const content = readFileSync(todayFile, 'utf-8');
+      memoryContent += `## Today's Memory (${formatDate(today)})\n\n${content}\n\n`;
+    } catch {}
+  }
+
+  return memoryContent;
+}
+
+/**
  * Create the bot
  */
 async function createBot(): Promise<Telegraf> {
-  // Load YAML/JSON tool skills from multiple directories
-  const skillsDirs = [SKILLS_DIR, `${AGENT_DIR}/skills`, `${CONTEXT_DIR}/skills`];
+  // Initialize project manager for Telegram channel
+  projectManager = getProjectManager('telegram');
+
+  // Use project-aware paths
+  CONTEXT_DIR = projectManager.getContextDir();
+  AGENT_DIR = process.env.AGENT_DIR || './agent';
+
+  console.log(`[Project] Context dir: ${CONTEXT_DIR}`);
+  console.log(`[Project] Working dir: ${projectManager.getWorkingDir()}`);
+
+  // Load YAML/JSON tool skills from multiple directories (including project skills)
+  const skillsDirs = [SKILLS_DIR, ...projectManager.getSkillsDirs(), `${AGENT_DIR}/skills`];
   let totalToolSkills = 0;
 
   for (const skillsPath of skillsDirs) {
@@ -239,6 +345,19 @@ async function createBot(): Promise<Telegraf> {
       // Directory doesn't exist or no skills found
     }
   }
+
+  // Load imported Claude skills (from ~/.localbot/skills/claude-imported/)
+  const importedSkillsDir = getImportedSkillsPath();
+  try {
+    const importedSkills = await loadMdSkills(importedSkillsDir, 'claude');
+    if (importedSkills.length > 0) {
+      mdSkills.push(...importedSkills);
+      console.log(`Loaded ${importedSkills.length} imported Claude skills from ${importedSkillsDir}`);
+    }
+  } catch {
+    // Imported skills dir may not exist yet - run /import-claude in terminal to import
+  }
+
   console.log(`Total skills: ${totalToolSkills} tools, ${mdSkills.length} prompts`);
 
   // Store for message-level skill injection
@@ -252,6 +371,13 @@ async function createBot(): Promise<Telegraf> {
   if (mdSkills.length > 0) {
     const skillsSection = buildSkillsPromptSection(mdSkills);
     systemPrompt += skillsSection;
+  }
+
+  // Load daily memory (clawdbot-style: today + yesterday)
+  const memoryContent = loadDailyMemory();
+  if (memoryContent) {
+    systemPrompt += `\n\n## Recent Memory\n\n${memoryContent}`;
+    console.log(`Loaded daily memory from ${CONTEXT_DIR}/memory`);
   }
 
   console.log(`Loaded context from ${context.sources.length} source(s): ${context.sources.join(', ')}`);
@@ -288,6 +414,9 @@ async function createBot(): Promise<Telegraf> {
       `/model - Switch model\n` +
       `/models - List available models\n` +
       `/tools - Show available tools\n` +
+      `/skills - Show available skills\n` +
+      `/projects - List projects\n` +
+      `/project - Switch project\n` +
       `/clear - Clear conversation\n` +
       `/status - Show current status\n` +
       `/help - Show this help\n\n` +
@@ -297,6 +426,11 @@ async function createBot(): Promise<Telegraf> {
 
   // /help command
   bot.command('help', async (ctx) => {
+    const activeProject = projectManager.getActiveProject();
+    const projectInfo = activeProject
+      ? `Project: \`${activeProject.config.displayName || activeProject.config.name}\``
+      : `_Using global context_`;
+
     await ctx.reply(
       `🤖 *LocalBot Help*\n\n` +
       `*Commands:*\n` +
@@ -304,6 +438,10 @@ async function createBot(): Promise<Telegraf> {
       `/model - Switch model (shows menu)\n` +
       `/models - List all available models\n` +
       `/tools - Show available tools\n` +
+      `/skills - Show available skills (Claude + project)\n` +
+      `/projects - List available projects\n` +
+      `/project <name> - Switch to a project\n` +
+      `/pwd - Show working directory\n` +
       `/clear - Clear conversation history\n` +
       `/status - Show bot status\n` +
       `/settings - Configure preferences\n\n` +
@@ -314,7 +452,8 @@ async function createBot(): Promise<Telegraf> {
       `- Reading/writing files\n` +
       `- Searching the web\n` +
       `- Browser automation\n\n` +
-      `Current model: \`${sessions.getModel(ctx.chat.id)}\``,
+      `Current model: \`${sessions.getModel(ctx.chat.id)}\`\n` +
+      `${projectInfo}`,
       { parse_mode: 'Markdown' }
     );
   });
@@ -377,10 +516,66 @@ async function createBot(): Promise<Telegraf> {
   // /tools command
   bot.command('tools', async (ctx) => {
     const tools = registry.getAll();
+    const telegramTools = tools.filter(t => t.name.startsWith('telegram_'));
+    const otherTools = tools.filter(t => !t.name.startsWith('telegram_'));
+
     let text = `🔧 *Available Tools* (${tools.length})\n\n`;
 
-    for (const tool of tools) {
-      text += `• *${tool.name}*: ${tool.description.slice(0, 60)}...\n`;
+    text += `*Telegram Tools:*\n`;
+    for (const tool of telegramTools) {
+      text += `• *${tool.name.replace('telegram_', '')}*: ${tool.description.slice(0, 50)}...\n`;
+    }
+
+    text += `\n*General Tools:*\n`;
+    for (const tool of otherTools.slice(0, 15)) {
+      text += `• *${tool.name}*: ${tool.description.slice(0, 50)}...\n`;
+    }
+
+    if (otherTools.length > 15) {
+      text += `\n_...and ${otherTools.length - 15} more_`;
+    }
+
+    await ctx.reply(text, { parse_mode: 'Markdown' });
+  });
+
+  // /skills command
+  bot.command('skills', async (ctx) => {
+    if (promptSkills.length === 0) {
+      await ctx.reply('📚 No skills loaded.');
+      return;
+    }
+
+    // Group skills by source
+    const projectSkills = promptSkills.filter(s => s.source === 'workspace');
+    const claudeSkills = promptSkills.filter(s => s.source === 'claude');
+    const otherSkills = promptSkills.filter(s => s.source !== 'workspace' && s.source !== 'claude');
+
+    let text = `📚 *Available Skills* (${promptSkills.length})\n\n`;
+
+    if (claudeSkills.length > 0) {
+      text += `*Claude Skills:*\n`;
+      for (const skill of claudeSkills) {
+        const priority = skill.metadata?.priority ? ` ⚡${skill.metadata.priority}` : '';
+        const triggers = skill.metadata?.triggers?.slice(0, 3).join(', ') || '';
+        text += `• *${skill.name}*${priority}\n  ${skill.description.slice(0, 60)}...\n  _Triggers: ${triggers}_\n`;
+      }
+      text += '\n';
+    }
+
+    if (projectSkills.length > 0) {
+      text += `*Project Skills:*\n`;
+      for (const skill of projectSkills) {
+        const priority = skill.metadata?.priority ? ` ⚡${skill.metadata.priority}` : '';
+        text += `• *${skill.name}*${priority}: ${skill.description.slice(0, 50)}...\n`;
+      }
+      text += '\n';
+    }
+
+    if (otherSkills.length > 0) {
+      text += `*Other Skills:*\n`;
+      for (const skill of otherSkills) {
+        text += `• *${skill.name}*: ${skill.description.slice(0, 50)}...\n`;
+      }
     }
 
     await ctx.reply(text, { parse_mode: 'Markdown' });
@@ -395,21 +590,39 @@ async function createBot(): Promise<Telegraf> {
   // /status command
   bot.command('status', async (ctx) => {
     const session = sessions.get(ctx.chat.id);
-    const stats = sessions.getStats();
+    const sessionStats = sessions.getStats();
     const toolStats = agent.getStats();
+    const sysStats = getSystemStats();
+    const ollamaStats = await getOllamaStats(OLLAMA_HOST);
+
+    const memPct = sysStats.memoryPercent.toFixed(0);
+    const load = sysStats.cpuLoad[0].toFixed(2);
+
+    let ollamaStatus = ollamaStats.running ? '✅ Running' : '❌ Not responding';
+    if (ollamaStats.activeModel) {
+      ollamaStatus += `\nActive: \`${ollamaStats.activeModel}\``;
+    }
+    if (ollamaStats.vram) {
+      ollamaStatus += `\nVRAM: ${formatBytes(ollamaStats.vram)}`;
+    }
 
     await ctx.reply(
-      `📊 *Status*\n\n` +
+      `📊 *System Status*\n\n` +
+      `*System:*\n` +
+      `Memory: ${formatBytes(sysStats.memoryUsed)} / ${formatBytes(sysStats.memoryTotal)} (${memPct}%)\n` +
+      `CPU Load: ${load} (${sysStats.cpuCount} cores)\n` +
+      `Uptime: ${formatUptime(sysStats.uptime)}\n\n` +
+      `*Ollama:*\n` +
+      `${ollamaStatus}\n` +
+      `Host: \`${OLLAMA_HOST}\`\n\n` +
       `*Your Session:*\n` +
       `Model: \`${session.model}\`\n` +
       `Messages: ${session.messages.length}\n\n` +
-      `*Global:*\n` +
-      `Active sessions: ${stats.totalSessions}\n` +
-      `Total messages: ${stats.totalMessages}\n` +
-      `Tool calls: ${toolStats.total}\n` +
-      `Success rate: ${((toolStats.successful / (toolStats.total || 1)) * 100).toFixed(0)}%\n\n` +
-      `*Connection:*\n` +
-      `Ollama: \`${OLLAMA_HOST}\``,
+      `*Bot Stats:*\n` +
+      `Sessions: ${sessionStats.totalSessions}\n` +
+      `Total messages: ${sessionStats.totalMessages}\n` +
+      `Tool calls: ${toolStats.total} (${((toolStats.successful / (toolStats.total || 1)) * 100).toFixed(0)}% success)\n` +
+      `Process mem: ${formatBytes(sysStats.processMemory)}`,
       { parse_mode: 'Markdown' }
     );
   });
@@ -463,12 +676,118 @@ async function createBot(): Promise<Telegraf> {
     });
   });
 
+  // /projects command - list available projects
+  bot.command('projects', async (ctx) => {
+    try {
+      const projects = await projectManager.listProjects();
+
+      if (projects.length === 0) {
+        await ctx.reply(
+          `📁 *No Projects Found*\n\n` +
+          `Projects directory: \`${projectManager.getProjectsRoot()}\`\n\n` +
+          `Create projects by adding directories with \`project.json\` files.`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      let text = `📁 *Available Projects*\n\n`;
+      for (const p of projects) {
+        const status = p.isActive ? ' ✅' : '';
+        const desc = p.description ? ` - ${p.description.slice(0, 40)}` : '';
+        text += `• \`${p.name}\`${status}${desc}\n`;
+      }
+
+      text += `\nUse /project <name> to switch projects.`;
+
+      await ctx.reply(text, { parse_mode: 'Markdown' });
+    } catch (error) {
+      await ctx.reply(`❌ Error listing projects: ${error instanceof Error ? error.message : 'Unknown'}`);
+    }
+  });
+
+  // /project command - switch to a project
+  bot.command('project', async (ctx) => {
+    const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
+
+    if (!args) {
+      // Show current project info
+      const active = projectManager.getActiveProject();
+      if (active) {
+        await ctx.reply(
+          `📂 *Current Project*\n\n` +
+          `Name: \`${active.config.displayName || active.config.name}\`\n` +
+          `Path: \`${active.rootPath}\`\n` +
+          `Working dir: \`${active.workingDirPath}\`\n` +
+          (active.config.description ? `\n${active.config.description}` : ''),
+          { parse_mode: 'Markdown' }
+        );
+      } else {
+        await ctx.reply(
+          `📂 *No Active Project*\n\n` +
+          `Using global context: \`${projectManager.getGlobalContextDir()}\`\n\n` +
+          `Use /projects to list available projects.`,
+          { parse_mode: 'Markdown' }
+        );
+      }
+      return;
+    }
+
+    // Handle 'clear' to return to global context
+    if (args === 'clear' || args === 'none') {
+      projectManager.clearActiveProject();
+      await ctx.reply('🔄 Cleared project. Using global context.');
+      return;
+    }
+
+    try {
+      const project = await projectManager.setActiveProject(args);
+
+      // Update context directories
+      CONTEXT_DIR = projectManager.getContextDir();
+
+      await ctx.reply(
+        `✅ Switched to project: *${project.config.displayName || project.config.name}*\n\n` +
+        `Working dir: \`${project.workingDirPath}\`\n` +
+        (project.config.description ? `\n${project.config.description}` : ''),
+        { parse_mode: 'Markdown' }
+      );
+    } catch (error) {
+      await ctx.reply(`❌ Failed to switch project: ${error instanceof Error ? error.message : 'Unknown'}`);
+    }
+  });
+
+  // /pwd command - show current working directory
+  bot.command('pwd', async (ctx) => {
+    const workingDir = projectManager.getWorkingDir();
+    const contextDir = projectManager.getContextDir();
+    const active = projectManager.getActiveProject();
+
+    let text = `📍 *Working Directory*\n\n`;
+    text += `Working: \`${workingDir}\`\n`;
+    text += `Context: \`${contextDir}\`\n`;
+
+    if (active) {
+      text += `\nProject: *${active.config.displayName || active.config.name}*`;
+    } else {
+      text += `\n_Using global context_`;
+    }
+
+    await ctx.reply(text, { parse_mode: 'Markdown' });
+  });
+
   // Handle text messages
   bot.on(message('text'), async (ctx) => {
     const chatId = ctx.chat.id;
     let userMessage = ctx.message.text;
     const session = sessions.get(chatId, ctx.from?.username);
     const prefs = sessions.getPreferences(chatId);
+
+    // Set Telegram context for tools (allows sending files, images, etc.)
+    setTelegramContext(ctx, chatId);
+
+    // Set chat ID for reminder delivery
+    setReminderTelegramChatId(chatId);
 
     // Auto-inject skill content if keywords match
     const matchedSkill = matchSkillByKeywords(userMessage, promptSkills);
@@ -597,17 +916,42 @@ IMPORTANT: Use the bash tool to EXECUTE the commands from the skill above. Do NO
 
       // Final update
       const finalContent = formatMessage(lastContent || 'I processed your request.', prefs.showToolCalls ? toolInfo : undefined);
-      await ctx.telegram.editMessageText(
-        chatId,
-        thinkingMsg.message_id,
-        undefined,
-        finalContent
-      );
+      try {
+        await ctx.telegram.editMessageText(
+          chatId,
+          thinkingMsg.message_id,
+          undefined,
+          finalContent
+        );
+      } catch (e) {
+        // Ignore "message not modified" error - happens when content hasn't changed
+        if (!(e instanceof Error && e.message.includes('message is not modified'))) {
+          throw e;
+        }
+      }
 
       // Add messages to session
       sessions.addMessage(chatId, { role: 'user', content: userMessage });
       sessions.addMessage(chatId, { role: 'assistant', content: lastContent });
       sessions.setLastMessageId(chatId, thinkingMsg.message_id);
+
+      // Log activity for dashboard
+      logActivity({
+        source: 'telegram',
+        type: 'message',
+        sessionId: session.id,
+        userId: ctx.from?.username || String(chatId),
+        content: ctx.message.text.slice(0, 100),
+      });
+
+      if (toolInfo) {
+        logActivity({
+          source: 'telegram',
+          type: 'tool_call',
+          sessionId: session.id,
+          content: toolInfo.slice(0, 100),
+        });
+      }
 
     } catch (error) {
       console.error('Message handling error:', error);
@@ -618,19 +962,362 @@ IMPORTANT: Use the bash tool to EXECUTE the commands from the skill above. Do NO
         `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
+    // Note: Don't clear context here - tool calls may still be pending
+    // Context will be overwritten by next message anyway
   });
 
   // Handle document uploads
   bot.on(message('document'), async (ctx) => {
-    await ctx.reply('📄 File upload support coming soon. For now, please share file contents as text.');
+    const chatId = ctx.chat.id;
+    const document = ctx.message.document;
+    const caption = ctx.message.caption;
+
+    console.log(`[Telegram] Document received: ${document.file_name} from chat ${chatId}`);
+
+    // Send processing indicator
+    const processingMsg = await ctx.reply('📄 Downloading file...');
+
+    try {
+      const result = await handleDocument(ctx, document, caption);
+
+      if (!result.success || !result.attachment) {
+        await ctx.telegram.editMessageText(
+          chatId,
+          processingMsg.message_id,
+          undefined,
+          `❌ Failed to download file: ${result.error}`
+        );
+        return;
+      }
+
+      const info = result.attachment;
+      const infoText = formatAttachmentInfo(info);
+
+      // Check if it's a text file we can preview
+      const textPreview = await getTextFilePreview(info.localPath);
+
+      // Set Telegram context for tools
+      setTelegramContext(ctx, chatId);
+      setReminderTelegramChatId(chatId);
+
+      const session = sessions.get(chatId, ctx.from?.username);
+
+      // Build context message for the agent
+      let contextMessage = `User uploaded a file:\n${infoText}\nSaved to: ${info.localPath}`;
+      if (caption) {
+        contextMessage += `\nCaption: ${caption}`;
+      }
+      if (textPreview) {
+        contextMessage += `\n\nFile preview:\n\`\`\`\n${textPreview}\n\`\`\``;
+      }
+
+      // Update status
+      await ctx.telegram.editMessageText(
+        chatId,
+        processingMsg.message_id,
+        undefined,
+        `✅ File saved: ${info.fileName}\n${infoText}`
+      );
+
+      // Process with agent if there's a caption (user wants something done)
+      if (caption) {
+        const thinkingMsg = await ctx.reply('💭 Processing your request...');
+        let lastContent = '';
+
+        try {
+          for await (const event of agent.runStream(contextMessage, session.id, session.userId)) {
+            if (event.type === 'content' && event.content) {
+              lastContent += event.content;
+            }
+          }
+
+          await ctx.telegram.editMessageText(
+            chatId,
+            thinkingMsg.message_id,
+            undefined,
+            lastContent || 'File processed.'
+          );
+
+          sessions.addMessage(chatId, { role: 'user', content: contextMessage });
+          sessions.addMessage(chatId, { role: 'assistant', content: lastContent });
+        } catch (error) {
+          await ctx.telegram.editMessageText(
+            chatId,
+            thinkingMsg.message_id,
+            undefined,
+            `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`
+          );
+        }
+      } else {
+        // Just acknowledge the file
+        await ctx.reply(
+          `📄 File received and saved.\n` +
+          `You can ask me to read, analyze, or work with this file.\n` +
+          `Path: \`${info.localPath}\``,
+          { parse_mode: 'Markdown' }
+        );
+      }
+    } catch (error) {
+      console.error('[Telegram] Document handling error:', error);
+      await ctx.telegram.editMessageText(
+        chatId,
+        processingMsg.message_id,
+        undefined,
+        `❌ Error processing file: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   });
 
   // Handle photos
   bot.on(message('photo'), async (ctx) => {
-    await ctx.reply('🖼️ Image analysis not yet supported. Please describe what you see instead.');
+    const chatId = ctx.chat.id;
+    const photos = ctx.message.photo;
+    const caption = ctx.message.caption;
+
+    console.log(`[Telegram] Photo received from chat ${chatId}`);
+
+    const processingMsg = await ctx.reply('🖼️ Downloading photo...');
+
+    try {
+      const result = await handlePhoto(ctx, photos, caption);
+
+      if (!result.success || !result.attachment) {
+        await ctx.telegram.editMessageText(
+          chatId,
+          processingMsg.message_id,
+          undefined,
+          `❌ Failed to download photo: ${result.error}`
+        );
+        return;
+      }
+
+      const info = result.attachment;
+      const infoText = formatAttachmentInfo(info);
+
+      await ctx.telegram.editMessageText(
+        chatId,
+        processingMsg.message_id,
+        undefined,
+        `✅ Photo saved\n${infoText}`
+      );
+
+      // Note: Vision/image analysis would require a multimodal model
+      await ctx.reply(
+        `🖼️ Photo received and saved.\n` +
+        `Path: \`${info.localPath}\`\n\n` +
+        `_Note: Image analysis requires a vision-capable model. ` +
+        `For now, please describe what's in the image if you need help with it._`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (error) {
+      console.error('[Telegram] Photo handling error:', error);
+      await ctx.telegram.editMessageText(
+        chatId,
+        processingMsg.message_id,
+        undefined,
+        `❌ Error processing photo: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  });
+
+  // Handle voice messages
+  bot.on(message('voice'), async (ctx) => {
+    const chatId = ctx.chat.id;
+    const voice = ctx.message.voice;
+
+    console.log(`[Telegram] Voice message received from chat ${chatId} (${voice.duration}s)`);
+
+    const processingMsg = await ctx.reply('🎤 Downloading voice message...');
+
+    try {
+      const result = await handleVoice(ctx, voice);
+
+      if (!result.success || !result.attachment) {
+        await ctx.telegram.editMessageText(
+          chatId,
+          processingMsg.message_id,
+          undefined,
+          `❌ Failed to download voice: ${result.error}`
+        );
+        return;
+      }
+
+      const info = result.attachment;
+      const infoText = formatAttachmentInfo(info);
+
+      await ctx.telegram.editMessageText(
+        chatId,
+        processingMsg.message_id,
+        undefined,
+        `✅ Voice message saved\n${infoText}`
+      );
+
+      await ctx.reply(
+        `🎤 Voice message received and saved.\n` +
+        `Duration: ${info.duration}s\n` +
+        `Path: \`${info.localPath}\`\n\n` +
+        `_Note: Voice transcription requires additional setup. ` +
+        `The audio file is saved for future processing._`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (error) {
+      console.error('[Telegram] Voice handling error:', error);
+      await ctx.telegram.editMessageText(
+        chatId,
+        processingMsg.message_id,
+        undefined,
+        `❌ Error processing voice: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  });
+
+  // Handle audio files
+  bot.on(message('audio'), async (ctx) => {
+    const chatId = ctx.chat.id;
+    const audio = ctx.message.audio;
+    const caption = ctx.message.caption;
+
+    console.log(`[Telegram] Audio file received: ${audio.file_name} from chat ${chatId}`);
+
+    const processingMsg = await ctx.reply('🎵 Downloading audio...');
+
+    try {
+      const result = await handleAudio(ctx, audio, caption);
+
+      if (!result.success || !result.attachment) {
+        await ctx.telegram.editMessageText(
+          chatId,
+          processingMsg.message_id,
+          undefined,
+          `❌ Failed to download audio: ${result.error}`
+        );
+        return;
+      }
+
+      const info = result.attachment;
+      const infoText = formatAttachmentInfo(info);
+
+      await ctx.telegram.editMessageText(
+        chatId,
+        processingMsg.message_id,
+        undefined,
+        `✅ Audio saved: ${info.fileName}\n${infoText}`
+      );
+
+      await ctx.reply(
+        `🎵 Audio file received and saved.\n` +
+        `Path: \`${info.localPath}\``,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (error) {
+      console.error('[Telegram] Audio handling error:', error);
+      await ctx.telegram.editMessageText(
+        chatId,
+        processingMsg.message_id,
+        undefined,
+        `❌ Error processing audio: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  });
+
+  // Handle video files
+  bot.on(message('video'), async (ctx) => {
+    const chatId = ctx.chat.id;
+    const video = ctx.message.video;
+    const caption = ctx.message.caption;
+
+    console.log(`[Telegram] Video received from chat ${chatId}`);
+
+    const processingMsg = await ctx.reply('🎬 Downloading video...');
+
+    try {
+      const result = await handleVideo(ctx, video, caption);
+
+      if (!result.success || !result.attachment) {
+        await ctx.telegram.editMessageText(
+          chatId,
+          processingMsg.message_id,
+          undefined,
+          `❌ Failed to download video: ${result.error}`
+        );
+        return;
+      }
+
+      const info = result.attachment;
+      const infoText = formatAttachmentInfo(info);
+
+      await ctx.telegram.editMessageText(
+        chatId,
+        processingMsg.message_id,
+        undefined,
+        `✅ Video saved\n${infoText}`
+      );
+
+      await ctx.reply(
+        `🎬 Video received and saved.\n` +
+        `Path: \`${info.localPath}\``,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (error) {
+      console.error('[Telegram] Video handling error:', error);
+      await ctx.telegram.editMessageText(
+        chatId,
+        processingMsg.message_id,
+        undefined,
+        `❌ Error processing video: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   });
 
   return bot;
+}
+
+/**
+ * Create Telegram delivery handler for reminders
+ */
+function createTelegramDeliveryHandler(): DeliveryHandler {
+  return async (job: CronJob, channel: DeliveryChannel) => {
+    if (channel.kind !== 'telegram' || !telegramApi) {
+      throw new Error('Telegram API not available');
+    }
+
+    const chatId = channel.chatId;
+    const message = `🔔 **Reminder: ${job.name}**\n\n${job.message}`;
+
+    await telegramApi.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+
+    logActivity({
+      source: 'cron',
+      type: 'reminder',
+      sessionId: `cron-${job.id}`,
+      content: `Delivered reminder: ${job.name}`,
+    });
+  };
+}
+
+/**
+ * Start the cron scheduler
+ */
+function startCronScheduler(): void {
+  cronScheduler = new CronScheduler({
+    checkIntervalMs: 60000, // Check every minute
+    deliveryHandlers: {
+      telegram: createTelegramDeliveryHandler(),
+    },
+    defaultHandler: async (job) => {
+      console.log(`[Reminder] ${job.name}: ${job.message}`);
+    },
+    onJobRun: (job, status, error) => {
+      if (status === 'ok') {
+        console.log(`[Cron] Reminder delivered: ${job.name}`);
+      } else {
+        console.error(`[Cron] Reminder failed: ${job.name} - ${error}`);
+      }
+    },
+  });
+
+  cronScheduler.start();
+  console.log('⏰ Cron scheduler started');
 }
 
 /**
@@ -655,9 +1342,23 @@ async function main() {
   try {
     const bot = await createBot();
 
+    // Store Telegram API reference for reminder delivery
+    telegramApi = bot.telegram;
+
+    // Start cron scheduler for reminders
+    startCronScheduler();
+
     // Graceful shutdown
     const shutdown = () => {
       console.log('\n👋 Shutting down...');
+      // Stop cron scheduler
+      if (cronScheduler) {
+        cronScheduler.stop();
+        console.log('⏰ Cron scheduler stopped');
+      }
+      // Save sessions before exit
+      sessions.saveToDisk();
+      console.log('💾 Sessions saved to disk');
       bot.stop('SIGTERM');
       process.exit(0);
     };

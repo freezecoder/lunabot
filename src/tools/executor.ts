@@ -5,6 +5,30 @@
 import type { Tool, ToolCall, ToolResult, ToolInvocation } from '../types.js';
 import type { ToolRegistry } from './registry.js';
 import { v4 as uuid } from 'uuid';
+import { getDB, createLogger, type Logger } from '../db/index.js';
+import type { Channel } from '../db/types.js';
+
+// Module-level logger and channel for tool operations
+let executorLogger: Logger | null = null;
+let executorChannel: Channel = 'system';
+
+/**
+ * Set the channel for tool executor logging
+ */
+export function setToolExecutorChannel(channel: Channel): void {
+  executorChannel = channel;
+  executorLogger = createLogger(channel);
+}
+
+/**
+ * Get the executor logger
+ */
+function getLogger(sessionId?: string): Logger {
+  if (!executorLogger) {
+    executorLogger = createLogger(executorChannel);
+  }
+  return sessionId ? executorLogger.forSession(sessionId) : executorLogger;
+}
 
 export interface ExecutorOptions {
   defaultTimeout?: number;
@@ -35,9 +59,16 @@ export class ToolExecutor {
     sessionId: string,
     model: string
   ): Promise<ToolResult> {
+    console.log(`[ToolExecutor] Executing tool: ${toolCall.function.name}`);
+    console.log(`[ToolExecutor] Arguments: ${toolCall.function.arguments}`);
+
     const tool = this.registry.get(toolCall.function.name);
+    const logger = getLogger(sessionId);
+    const db = getDB();
 
     if (!tool) {
+      console.log(`[ToolExecutor] ERROR: Unknown tool "${toolCall.function.name}"`);
+      logger.toolError(toolCall.function.name, 'Unknown tool', 0);
       return {
         tool_call_id: toolCall.id,
         content: `Error: Unknown tool "${toolCall.function.name}". Available tools: ${this.registry.getNames().join(', ')}`,
@@ -49,6 +80,8 @@ export class ToolExecutor {
     try {
       args = JSON.parse(toolCall.function.arguments);
     } catch {
+      console.log(`[ToolExecutor] ERROR: Invalid JSON arguments`);
+      logger.toolError(tool.name, 'Invalid JSON arguments', 0);
       return {
         tool_call_id: toolCall.id,
         content: `Error: Invalid JSON arguments for tool "${toolCall.function.name}": ${toolCall.function.arguments}`,
@@ -69,6 +102,16 @@ export class ToolExecutor {
 
     this.options.onToolStart?.(invocation);
 
+    // Log tool start to database
+    logger.toolStart(tool.name, args);
+    db.startToolExecution({
+      id: invocation.id,
+      session_id: sessionId,
+      tool_name: tool.name,
+      arguments: JSON.stringify(args),
+      started_at: invocation.startTime.getTime(),
+    });
+
     // Check if confirmation is required
     if (tool.requiresConfirmation && this.options.confirmationHandler) {
       const confirmed = await this.options.confirmationHandler(tool, args);
@@ -79,6 +122,10 @@ export class ToolExecutor {
         invocation.isError = true;
         this.history.push(invocation);
         this.options.onToolEnd?.(invocation);
+
+        // Complete tool execution in database
+        db.completeToolExecution(invocation.id, 'Cancelled by user', true, invocation.duration);
+        logger.toolError(tool.name, 'Cancelled by user', invocation.duration);
 
         return {
           tool_call_id: toolCall.id,
@@ -92,6 +139,7 @@ export class ToolExecutor {
     const timeout = tool.timeout || this.options.defaultTimeout || 60000;
 
     try {
+      console.log(`[ToolExecutor] Calling ${tool.name}.execute()...`);
       const result = await Promise.race([
         tool.execute(args),
         new Promise<never>((_, reject) =>
@@ -105,6 +153,13 @@ export class ToolExecutor {
       invocation.isError = false;
       this.history.push(invocation);
       this.options.onToolStart?.(invocation);
+
+      console.log(`[ToolExecutor] ${tool.name} completed in ${invocation.duration}ms`);
+      console.log(`[ToolExecutor] Result: ${result.slice(0, 200)}${result.length > 200 ? '...' : ''}`);
+
+      // Complete tool execution in database
+      db.completeToolExecution(invocation.id, result.slice(0, 10000), false, invocation.duration);
+      logger.toolSuccess(tool.name, invocation.duration);
 
       return {
         tool_call_id: toolCall.id,
@@ -120,6 +175,12 @@ export class ToolExecutor {
       invocation.isError = true;
       this.history.push(invocation);
       this.options.onToolError?.(invocation, error instanceof Error ? error : new Error(errorMessage));
+
+      console.error(`[ToolExecutor] ERROR in ${tool.name}: ${errorMessage}`);
+
+      // Complete tool execution in database
+      db.completeToolExecution(invocation.id, errorMessage, true, invocation.duration);
+      logger.toolError(tool.name, errorMessage, invocation.duration);
 
       return {
         tool_call_id: toolCall.id,

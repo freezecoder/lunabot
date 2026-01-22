@@ -10,22 +10,42 @@ import { ToolRegistry } from '../tools/registry.js';
 import { getAllBuiltInTools } from '../tools/built-in/index.js';
 import { loadSkillsFromDirectory } from '../tools/skill-loader.js';
 import { loadSkillsFromDirectory as loadMdSkills } from '../skills/loader.js';
+import { importClaudeSkills, listClaudeSkills, getImportedSkillsPath } from '../skills/claude-importer.js';
 import type { SkillEntry } from '../skills/types.js';
+import { getClaudeSkillsDir, isClaudeSkillsEnabled, getLocalbotHome } from '../config/paths.js';
 import { loadContext, buildSystemPrompt, getContextSummary, type LoadedContext } from '../context/loader.js';
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { MODEL_CAPABILITIES } from '../router/router.js';
 import { mcpManager, loadMcpConfig, type McpServerConfig } from '../mcp/client.js';
 import { globalMetrics } from '../tracking/metrics.js';
 import { globalTokenTracker, calculateContextPercentage } from '../tracking/tokens.js';
+import { globalSessionManager } from '../session/manager.js';
+import { getMemoryManager, setMemoryLoggerChannel } from '../memory/manager.js';
+import { getCompactStatus, getFullSystemReport, getOllamaStats, formatBytes, formatUptime } from '../utils/system-monitor.js';
+import { logActivity } from '../utils/activity-tracker.js';
+import { join } from 'path';
+import { getDB, createLogger, type Logger } from '../db/index.js';
+import type { SkillInfo, WorkspaceFileInfo } from '../db/types.js';
+import { setWorkspaceLoggerChannel } from '../workspace/loader.js';
+import { setToolExecutorChannel } from '../tools/executor.js';
+import { getProjectManager, type ProjectManager, type ProjectSummary } from '../project/index.js';
 import 'dotenv/config';
+
+// Terminal logger
+let terminalLogger: Logger;
+
+// Project manager
+let projectManager: ProjectManager;
 
 // Configuration
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://100.121.61.16:11434';
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'llama3.1:8b';
 const SKILLS_DIR = process.env.SKILLS_DIR || './skills';
-const AGENT_DIR = process.env.AGENT_DIR || './agent';
-const CONTEXT_DIR = process.env.CONTEXT_DIR || '/Users/zayed/clawd';
 const MCP_CONFIG = process.env.MCP_CONFIG || './config/mcp.yaml';
+
+// These will be set by project manager
+let CONTEXT_DIR: string;
+let AGENT_DIR: string;
 
 // State
 let currentModel = DEFAULT_MODEL;
@@ -33,8 +53,9 @@ let agent: Agent;
 let provider: OllamaProvider;
 let registry: ToolRegistry;
 let context: LoadedContext;
-let sessionId = `terminal-${Date.now()}`;
+let sessionId = 'terminal-default';  // Persistent session ID
 let showTools = true;
+let memoryContext = '';  // Today's/yesterday's memory loaded on startup
 
 // Skill state
 let promptSkills: SkillEntry[] = [];
@@ -63,7 +84,13 @@ function printHeader() {
   // Get identity info
   let title = '🤖 LocalBot CLI';
   let emoji = '';
-  if (context?.identity) {
+
+  // Check project identity first
+  const activeProject = projectManager?.getActiveProject();
+  if (activeProject?.config.identity?.name) {
+    title = `${activeProject.config.identity.name} CLI`;
+    emoji = activeProject.config.identity.emoji || '';
+  } else if (context?.identity) {
     const lines = context.identity.content.split('\n');
     for (const line of lines) {
       if (line.toLowerCase().includes('name:')) {
@@ -81,6 +108,13 @@ function printHeader() {
 ║                    ${emoji} ${title.padEnd(40)}║
 ╚══════════════════════════════════════════════════════════════╝
 `));
+
+  // Show current project
+  if (activeProject) {
+    const projectName = activeProject.config.displayName || activeProject.config.name;
+    console.log(colors.info(`  Project: ${colors.success(projectName)}`));
+    console.log(colors.info(`  WorkDir: ${activeProject.workingDirPath}`));
+  }
 
   console.log(colors.info(`  Model: ${colors.model(currentModel)}`));
   console.log(colors.info(`  Ollama: ${OLLAMA_HOST}`));
@@ -108,17 +142,60 @@ function printHeader() {
     console.log(colors.info(`  Tokens: ↓${sessionStats.totalInput} ↑${sessionStats.totalOutput} (ctx: ${ctxPct.toFixed(1)}%)`));
   }
 
+  // Show system stats
+  console.log(colors.info(`  System: ${getCompactStatus()}`));
+
   console.log(colors.info(`  Type ${colors.command('/help')} for commands\n`));
   console.log(chalk.gray('─'.repeat(64)) + '\n');
+}
+
+/**
+ * Load today's and yesterday's memory files (clawdbot-style)
+ */
+async function loadDailyMemory(): Promise<string> {
+  const memoryDir = join(CONTEXT_DIR, 'memory');
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  const formatDate = (d: Date) => d.toISOString().split('T')[0];
+  const todayFile = join(memoryDir, `${formatDate(today)}.md`);
+  const yesterdayFile = join(memoryDir, `${formatDate(yesterday)}.md`);
+
+  let memoryContent = '';
+
+  // Load yesterday first if exists
+  if (existsSync(yesterdayFile)) {
+    try {
+      const content = readFileSync(yesterdayFile, 'utf-8');
+      memoryContent += `## Yesterday's Memory (${formatDate(yesterday)})\n\n${content}\n\n`;
+    } catch {}
+  }
+
+  // Load today if exists
+  if (existsSync(todayFile)) {
+    try {
+      const content = readFileSync(todayFile, 'utf-8');
+      memoryContent += `## Today's Memory (${formatDate(today)})\n\n${content}\n\n`;
+    } catch {}
+  }
+
+  return memoryContent;
 }
 
 /**
  * Print help message
  */
 function printHelp() {
+  const activeProject = projectManager?.getActiveProject();
+  const contextInfo = activeProject
+    ? `project ${colors.success(activeProject.config.name)}`
+    : `global context (${CONTEXT_DIR})`;
+
   console.log(`
 ${chalk.bold('Commands:')}
   ${colors.command('/help')}      - Show this help
+  ${colors.command('/status')}    - Show system status (memory, CPU, Ollama)
   ${colors.command('/model')}     - Switch model (e.g., /model llama3.1:8b)
   ${colors.command('/models')}    - List available models
   ${colors.command('/tools')}     - List available tools
@@ -133,8 +210,26 @@ ${chalk.bold('Commands:')}
   ${colors.command('/reset')}     - Reset screen
   ${colors.command('/exit')}      - Exit
 
+${chalk.bold('Project Commands:')}
+  ${colors.command('/projects')}  - List available projects
+  ${colors.command('/project')}   - Switch project (e.g., /project myapp)
+  ${colors.command('/project off')} - Return to global context
+  ${colors.command('/pwd')}       - Show current working directory
+
+${chalk.bold('Session Commands:')}
+  ${colors.command('/sessions')}  - List saved sessions
+  ${colors.command('/history')}   - Show conversation history
+  ${colors.command('/save')}      - Save current conversation to memory
+  ${colors.command('/new')}       - Start new session (preserves old)
+  ${colors.command('/load')}      - Load a previous session
+
+${chalk.bold('Claude Skills:')}
+  ${colors.command('/list-claude')}   - List available Claude skills
+  ${colors.command('/import-claude')} - Import Claude skills to LocalBot
+
 ${chalk.bold('Tips:')}
-  • The assistant knows your context from ${CONTEXT_DIR}
+  • Currently working in ${contextInfo}
+  • Session memory is automatically persisted
   • Tool calls shown in ${colors.tool('yellow')}
   • Token usage: ↓ = input, ↑ = output, ctx = context window %
   • Use /skill <name> to load a skill context (e.g., /skill genomics-jobs)
@@ -287,16 +382,36 @@ function listSkills() {
   if (promptSkills.length === 0) {
     console.log(colors.info('  No skills loaded.'));
     console.log(colors.info(`  Add SKILL.md files to ${CONTEXT_DIR}/skills/`));
+    if (isClaudeSkillsEnabled()) {
+      console.log(colors.info(`  Claude skills dir: ${getClaudeSkillsDir()}`));
+    }
     console.log();
     return;
   }
 
+  // Group skills by source
+  const bySource = new Map<string, SkillEntry[]>();
   for (const skill of promptSkills) {
-    const isActive = activeSkill?.name === skill.name;
-    const status = isActive ? colors.success(' ← active') : '';
-    console.log(`  ${colors.tool('•')} ${chalk.bold(skill.name)}${status}`);
-    console.log(`    ${colors.info(skill.description.slice(0, 70))}...`);
-    console.log(`    ${colors.info(`Source: ${skill.source}`)}`);
+    const source = skill.source;
+    if (!bySource.has(source)) {
+      bySource.set(source, []);
+    }
+    bySource.get(source)!.push(skill);
+  }
+
+  for (const [source, skills] of bySource) {
+    const sourceLabel = source === 'claude' ? 'Claude Skills' : source;
+    console.log(colors.info(`  [${sourceLabel}]`));
+    for (const skill of skills) {
+      const isActive = activeSkill?.name === skill.name;
+      const status = isActive ? colors.success(' ← active') : '';
+      const priority = skill.metadata?.priority ? colors.info(` ⚡${skill.metadata.priority}`) : '';
+      console.log(`    ${colors.tool('•')} ${chalk.bold(skill.name)}${priority}${status}`);
+      console.log(`      ${colors.info(skill.description.slice(0, 60))}...`);
+      if (skill.metadata?.triggers?.length) {
+        console.log(`      ${colors.info(`Triggers: ${skill.metadata.triggers.slice(0, 3).join(', ')}`)}`);
+      }
+    }
   }
   console.log();
 
@@ -341,6 +456,33 @@ function setSkill(skillName: string) {
 }
 
 /**
+ * Auto-match a message to a skill based on triggers
+ * Returns highest priority skill that matches
+ */
+function autoMatchSkill(message: string): SkillEntry | null {
+  const lower = message.toLowerCase();
+  const matches: Array<{ skill: SkillEntry; priority: number }> = [];
+
+  for (const skill of promptSkills) {
+    // Check skill metadata triggers (from YAML frontmatter)
+    const triggers = skill.metadata?.triggers || [];
+    for (const trigger of triggers) {
+      if (lower.includes(trigger.toLowerCase())) {
+        const priority = skill.metadata?.priority ?? 0;
+        matches.push({ skill, priority });
+        break;
+      }
+    }
+  }
+
+  if (matches.length === 0) return null;
+
+  // Sort by priority (highest first) and return the best match
+  matches.sort((a, b) => b.priority - a.priority);
+  return matches[0].skill;
+}
+
+/**
  * Show MCP servers and their tools
  */
 function showMcp() {
@@ -381,7 +523,12 @@ function showMcp() {
  * Create agent with current settings
  */
 function createAgent(): Agent {
-  const systemPrompt = buildSystemPrompt(context, registry.getSummary());
+  let systemPrompt = buildSystemPrompt(context, registry.getSummary());
+
+  // Inject memory context if available
+  if (memoryContext) {
+    systemPrompt = `${systemPrompt}\n\n## Recent Memory\n\n${memoryContext}`;
+  }
 
   return new Agent({
     provider,
@@ -432,10 +579,369 @@ async function loadMcpServers() {
  * Reload context and MCP servers
  */
 async function reloadContext() {
+  // Reload context files
   context = await loadContext(CONTEXT_DIR, AGENT_DIR);
+  memoryContext = await loadDailyMemory();
+
+  // Reload skills
+  promptSkills = [];
+  const mdSkillsDirs = [`${CONTEXT_DIR}/skills`, `${AGENT_DIR}/skills`, SKILLS_DIR];
+  let skillCount = 0;
+
+  for (const skillsPath of mdSkillsDirs) {
+    try {
+      const skills = await loadMdSkills(skillsPath, 'workspace');
+      if (skills.length > 0) {
+        promptSkills.push(...skills);
+        skillCount += skills.length;
+      }
+    } catch {}
+  }
+
+  // Reload imported Claude skills
+  const importedSkillsDir = getImportedSkillsPath();
+  try {
+    const importedSkills = await loadMdSkills(importedSkillsDir, 'claude');
+    if (importedSkills.length > 0) {
+      promptSkills.push(...importedSkills);
+      skillCount += importedSkills.length;
+      console.log(colors.info(`  Imported Claude skills: ${importedSkills.length}`));
+    }
+  } catch {}
+
   const mcpCount = await loadMcpServers();
   agent = createAgent();
-  console.log(colors.success(`\n✓ Reloaded ${context.files.length} context files, ${mcpCount} MCP servers\n`));
+  console.log(colors.success(`\n✓ Reloaded ${context.files.length} context files, ${skillCount} skills, ${mcpCount} MCP servers\n`));
+}
+
+/**
+ * List saved sessions
+ */
+async function listSessions() {
+  const sessions = await globalSessionManager.listSessions();
+  console.log(`\n${chalk.bold('Saved Sessions:')} (${sessions.length})\n`);
+
+  if (sessions.length === 0) {
+    console.log(colors.info('  No saved sessions.'));
+    console.log();
+    return;
+  }
+
+  for (const id of sessions.slice(0, 10)) {
+    const stats = await globalSessionManager.getStats(id);
+    const isCurrent = id === sessionId ? colors.success(' ← current') : '';
+    const msgCount = stats?.messageCount || 0;
+    console.log(`  ${colors.tool('•')} ${chalk.bold(id)}${isCurrent}`);
+    console.log(colors.info(`    Messages: ${msgCount}`));
+  }
+
+  if (sessions.length > 10) {
+    console.log(colors.info(`  ... and ${sessions.length - 10} more`));
+  }
+  console.log();
+}
+
+/**
+ * Show conversation history
+ */
+async function showHistory() {
+  const messages = globalSessionManager.getMessages(sessionId);
+  console.log(`\n${chalk.bold('Conversation History:')} (${messages.length} messages)\n`);
+
+  if (messages.length === 0) {
+    console.log(colors.info('  No messages in this session.'));
+    console.log();
+    return;
+  }
+
+  for (const msg of messages.slice(-20)) {  // Last 20 messages
+    const role = msg.role === 'user' ? colors.user('You') :
+                 msg.role === 'assistant' ? colors.assistant('Assistant') :
+                 colors.info(msg.role);
+
+    const content = typeof msg.content === 'string'
+      ? msg.content.slice(0, 100)
+      : '[complex content]';
+
+    console.log(`  ${role}: ${content}${content.length >= 100 ? '...' : ''}`);
+  }
+
+  if (messages.length > 20) {
+    console.log(colors.info(`  ... showing last 20 of ${messages.length} messages`));
+  }
+  console.log();
+}
+
+/**
+ * Save conversation to memory file
+ */
+async function saveToMemory() {
+  const messages = globalSessionManager.getMessages(sessionId);
+
+  if (messages.length === 0) {
+    console.log(colors.error('\nNo messages to save.\n'));
+    return;
+  }
+
+  // Create summary of conversation
+  const summary = messages
+    .filter(m => m.role === 'user' || m.role === 'assistant')
+    .map(m => {
+      const role = m.role === 'user' ? 'User' : 'Assistant';
+      const content = typeof m.content === 'string' ? m.content.slice(0, 200) : '[tool call]';
+      return `**${role}:** ${content}`;
+    })
+    .join('\n\n');
+
+  const memoryManager = await getMemoryManager();
+  const filepath = await memoryManager.flush(`## Session Summary\n\n${summary}`);
+
+  console.log(colors.success(`\n✓ Saved to ${filepath}\n`));
+}
+
+/**
+ * Start new session
+ */
+async function startNewSession() {
+  const newId = `terminal-${Date.now()}`;
+  await globalSessionManager.getSession(newId);
+  sessionId = newId;
+  agent = createAgent();
+  console.log(colors.success(`\n✓ Started new session: ${sessionId}\n`));
+}
+
+/**
+ * Show system status
+ */
+async function showStatus() {
+  console.log(`\n${chalk.bold('System Status:')}\n`);
+
+  const report = await getFullSystemReport(OLLAMA_HOST);
+  console.log(colors.info(report));
+
+  // Add session info
+  const stats = await globalSessionManager.getStats(sessionId);
+  console.log(colors.info(`\n### Session`));
+  console.log(colors.info(`  ID: ${sessionId}`));
+  console.log(colors.info(`  Messages: ${stats?.messageCount || 0}`));
+  console.log(colors.info(`  Model: ${currentModel}`));
+
+  // Tool stats
+  const toolStats = agent.getStats();
+  console.log(colors.info(`\n### Tools`));
+  console.log(colors.info(`  Registered: ${registry.size}`));
+  console.log(colors.info(`  Calls: ${toolStats.total} (${toolStats.successful} successful)`));
+
+  console.log();
+}
+
+/**
+ * Load a previous session
+ */
+async function loadSession(targetId: string) {
+  const sessions = await globalSessionManager.listSessions();
+
+  // Find matching session
+  const match = sessions.find(s => s === targetId || s.includes(targetId));
+
+  if (!match) {
+    console.log(colors.error(`\nSession "${targetId}" not found.`));
+    console.log(colors.info('Use /sessions to see available sessions.\n'));
+    return;
+  }
+
+  await globalSessionManager.getSession(match);
+  sessionId = match;
+  agent = createAgent();
+
+  const stats = await globalSessionManager.getStats(sessionId);
+  console.log(colors.success(`\n✓ Loaded session: ${sessionId}`));
+  console.log(colors.info(`  Messages: ${stats?.messageCount || 0}\n`));
+}
+
+/**
+ * List available projects
+ */
+async function listProjects() {
+  const projects = await projectManager.listProjects();
+
+  console.log(`\n${chalk.bold('Available Projects:')} (${projects.length})\n`);
+
+  if (projects.length === 0) {
+    console.log(colors.info('  No projects found.'));
+    console.log(colors.info(`  Create a project directory in ${projectManager.getProjectsRoot()}/`));
+    console.log(colors.info(`  Or use: /project /path/to/your/project\n`));
+    return;
+  }
+
+  for (const project of projects) {
+    const status = project.isActive ? colors.success(' ← active') : '';
+    const configBadge = project.hasConfig ? '' : colors.info(' (no config)');
+    console.log(`  ${colors.tool('•')} ${chalk.bold(project.displayName)}${status}${configBadge}`);
+    if (project.description) {
+      console.log(colors.info(`    ${project.description.slice(0, 60)}...`));
+    }
+    console.log(colors.info(`    ${project.path}`));
+  }
+
+  console.log();
+  console.log(colors.info('  Use /project <name> to switch projects'));
+  console.log(colors.info('  Use /project off to return to global context'));
+  console.log();
+}
+
+/**
+ * Switch to a project
+ */
+async function switchProject(nameOrPath: string) {
+  // Handle 'off' command
+  if (nameOrPath === 'off' || nameOrPath === 'none' || nameOrPath === 'clear') {
+    projectManager.clearActiveProject();
+
+    // Reset to global context
+    CONTEXT_DIR = projectManager.getGlobalContextDir();
+    AGENT_DIR = './agent';
+
+    // Reload context
+    await reloadContext();
+
+    console.log(colors.success('\n✓ Returned to global context\n'));
+    return;
+  }
+
+  try {
+    const project = await projectManager.setActiveProject(nameOrPath);
+
+    // Update context directories
+    CONTEXT_DIR = project.rootPath;
+    AGENT_DIR = project.rootPath;
+
+    // Update model if project specifies one
+    if (project.config.model) {
+      currentModel = project.config.model;
+    }
+
+    // Reload context with new project
+    await reloadContext();
+
+    const displayName = project.config.displayName || project.config.name;
+    console.log(colors.success(`\n✓ Switched to project: ${colors.model(displayName)}`));
+    console.log(colors.info(`  Working directory: ${project.workingDirPath}`));
+    if (project.hasLocalIdentity) {
+      console.log(colors.info(`  Project has local identity files`));
+    }
+    if (project.hasLocalSkills) {
+      console.log(colors.info(`  Project has local skills`));
+    }
+    console.log();
+  } catch (error) {
+    console.log(colors.error(`\nFailed to switch project: ${error instanceof Error ? error.message : error}`));
+    console.log(colors.info('Use /projects to see available projects.\n'));
+  }
+}
+
+/**
+ * Show current project info
+ */
+function showCurrentProject() {
+  const project = projectManager.getActiveProject();
+
+  if (!project) {
+    console.log(colors.info(`\nNo active project. Using global context.`));
+    console.log(colors.info(`  Context: ${CONTEXT_DIR}`));
+    console.log(colors.info('  Use /projects to see available projects.\n'));
+    return;
+  }
+
+  const displayName = project.config.displayName || project.config.name;
+  console.log(`\n${chalk.bold('Current Project:')} ${colors.success(displayName)}\n`);
+  if (project.config.description) {
+    console.log(colors.info(`  ${project.config.description}`));
+  }
+  console.log(colors.info(`  Root: ${project.rootPath}`));
+  console.log(colors.info(`  Working dir: ${project.workingDirPath}`));
+  console.log(colors.info(`  Memory dir: ${project.memoryDirPath}`));
+  if (project.config.model) {
+    console.log(colors.info(`  Model: ${project.config.model}`));
+  }
+  console.log(colors.info(`  Local identity: ${project.hasLocalIdentity ? 'yes' : 'no'}`));
+  console.log(colors.info(`  Local skills: ${project.hasLocalSkills ? 'yes' : 'no'}`));
+  console.log();
+}
+
+/**
+ * Show current working directory
+ */
+function showWorkingDirectory() {
+  const project = projectManager.getActiveProject();
+  const workDir = project ? project.workingDirPath : CONTEXT_DIR;
+
+  console.log(colors.info(`\n  Working directory: ${workDir}\n`));
+}
+
+/**
+ * Import Claude skills
+ */
+async function importClaudeSkillsCommand() {
+  console.log(colors.info(`\nImporting Claude skills from ${getClaudeSkillsDir()}...`));
+
+  try {
+    const results = await importClaudeSkills();
+
+    if (results.length === 0) {
+      console.log(colors.info('No Claude skills found to import.'));
+      console.log(colors.info(`Claude skills directory: ${getClaudeSkillsDir()}`));
+      console.log();
+      return;
+    }
+
+    const successful = results.filter(r => r.success);
+    const failed = results.filter(r => !r.success);
+
+    console.log(colors.success(`\n✓ Imported ${successful.length} Claude skills:`));
+    for (const skill of successful) {
+      const scriptInfo = skill.hasScript ? ` (with script)` : '';
+      console.log(colors.info(`  • ${skill.name}${scriptInfo}`));
+    }
+
+    if (failed.length > 0) {
+      console.log(colors.error(`\n✗ Failed to import ${failed.length} skills:`));
+      for (const skill of failed) {
+        console.log(colors.error(`  • ${skill.name}: ${skill.error}`));
+      }
+    }
+
+    console.log(colors.info(`\nImported to: ${getImportedSkillsPath()}`));
+    console.log(colors.info('Run /reload to load the imported skills.\n'));
+  } catch (error) {
+    console.log(colors.error(`\nFailed to import Claude skills: ${error instanceof Error ? error.message : error}\n`));
+  }
+}
+
+/**
+ * List available Claude skills (not yet imported)
+ */
+async function listClaudeSkillsCommand() {
+  console.log(colors.info(`\nClaude skills directory: ${getClaudeSkillsDir()}\n`));
+
+  try {
+    const skills = await listClaudeSkills();
+
+    if (skills.length === 0) {
+      console.log(colors.info('No Claude skills found.'));
+      console.log();
+      return;
+    }
+
+    console.log(chalk.bold(`Available Claude skills (${skills.length}):\n`));
+    for (const skill of skills) {
+      console.log(colors.info(`  • ${skill}`));
+    }
+
+    console.log(colors.info(`\nUse /import-claude to import these skills.\n`));
+  } catch (error) {
+    console.log(colors.error(`\nFailed to list Claude skills: ${error instanceof Error ? error.message : error}\n`));
+  }
 }
 
 /**
@@ -451,6 +957,9 @@ async function processInput(input: string, rl: readline.Interface) {
     switch (cmd.toLowerCase()) {
       case 'help':
         printHelp();
+        return;
+      case 'status':
+        await showStatus();
         return;
       case 'model':
         if (args[0]) {
@@ -499,14 +1008,55 @@ async function processInput(input: string, rl: readline.Interface) {
         console.log(colors.info(`\nTool visibility: ${showTools ? 'ON' : 'OFF'}\n`));
         return;
       case 'clear':
-        sessionId = `terminal-${Date.now()}`;
+        await globalSessionManager.clearSession(sessionId);
         console.log(colors.success('\n✓ Conversation cleared\n'));
         return;
       case 'reset':
         printHeader();
         return;
+      case 'sessions':
+        await listSessions();
+        return;
+      case 'history':
+        await showHistory();
+        return;
+      case 'save':
+        await saveToMemory();
+        return;
+      case 'new':
+        await startNewSession();
+        return;
+      case 'load':
+        if (args[0]) {
+          await loadSession(args.join(' '));
+        } else {
+          console.log(colors.info('Usage: /load <session_id>'));
+          console.log(colors.info('Use /sessions to see available sessions.\n'));
+        }
+        return;
+      case 'projects':
+        await listProjects();
+        return;
+      case 'project':
+        if (args[0]) {
+          await switchProject(args.join(' '));
+        } else {
+          showCurrentProject();
+        }
+        return;
+      case 'pwd':
+        showWorkingDirectory();
+        return;
+      case 'import-claude':
+        await importClaudeSkillsCommand();
+        return;
+      case 'list-claude':
+        await listClaudeSkillsCommand();
+        return;
       case 'exit':
       case 'quit':
+        // Persist session before exit
+        await globalSessionManager.persistAll();
         console.log(colors.info('\nGoodbye! 👋\n'));
         rl.close();
         process.exit(0);
@@ -518,18 +1068,37 @@ async function processInput(input: string, rl: readline.Interface) {
 
   if (!trimmed) return;
 
-  // Inject skill content if active
+  // Inject skill content if active (manual or auto-matched)
   let messageToSend = trimmed;
-  if (activeSkill && activeSkillContent) {
-    messageToSend = `## SKILL CONTEXT: ${activeSkill.name}
+  let usedSkill: SkillEntry | null = null;
+  let usedSkillContent: string | null = null;
 
-${activeSkillContent}
+  if (activeSkill && activeSkillContent) {
+    // Use manually activated skill
+    usedSkill = activeSkill;
+    usedSkillContent = activeSkillContent;
+  } else {
+    // Try auto-matching based on triggers
+    const matched = autoMatchSkill(trimmed);
+    if (matched) {
+      try {
+        usedSkillContent = readFileSync(matched.path, 'utf-8');
+        usedSkill = matched;
+      } catch {}
+    }
+  }
+
+  if (usedSkill && usedSkillContent) {
+    messageToSend = `## SKILL CONTEXT: ${usedSkill.name}
+
+${usedSkillContent}
 
 ## USER REQUEST
 ${trimmed}
 
 IMPORTANT: Use the bash tool to execute any commands from the skill instructions. Show real output, don't just explain.`;
-    console.log(colors.info(`  [Using skill: ${activeSkill.name}]\n`));
+    const autoLabel = activeSkill ? '' : ' (auto)';
+    console.log(colors.info(`  [Using skill: ${usedSkill.name}${autoLabel}]\n`));
   }
 
   // Process message
@@ -602,6 +1171,30 @@ IMPORTANT: Use the bash tool to execute any commands from the skill instructions
       console.log();
     }
 
+    // Auto-persist messages to session store
+    await globalSessionManager.addMessage(sessionId, { role: 'user', content: trimmed });
+    if (content) {
+      await globalSessionManager.addMessage(sessionId, { role: 'assistant', content });
+    }
+
+    // Log activity for dashboard
+    logActivity({
+      source: 'terminal',
+      type: 'message',
+      sessionId,
+      content: trimmed.slice(0, 100),
+    });
+
+    if (toolsUsed.length > 0) {
+      logActivity({
+        source: 'terminal',
+        type: 'tool_call',
+        sessionId,
+        content: `Used: ${toolsUsed.join(', ')}`,
+        metadata: { tools: toolsUsed },
+      });
+    }
+
   } catch (error) {
     console.log(colors.error(`\n\nError: ${error instanceof Error ? error.message : error}\n`));
   }
@@ -611,6 +1204,28 @@ IMPORTANT: Use the bash tool to execute any commands from the skill instructions
  * Main entry point
  */
 async function main() {
+  const startTime = Date.now();
+  const skillsInfo: SkillInfo[] = [];
+
+  // Initialize database and logger
+  const db = getDB();
+  terminalLogger = createLogger('terminal');
+
+  // Set channel for all loggers
+  setWorkspaceLoggerChannel('terminal');
+  setMemoryLoggerChannel('terminal');
+  setToolExecutorChannel('terminal');
+
+  terminalLogger.startupBegin();
+
+  // Initialize project manager
+  projectManager = getProjectManager('terminal');
+  CONTEXT_DIR = projectManager.getGlobalContextDir();
+  AGENT_DIR = process.env.AGENT_DIR || './agent';
+
+  console.log(`Projects root: ${projectManager.getProjectsRoot()}`);
+  console.log(`Global context: ${CONTEXT_DIR}`);
+
   // Initialize provider
   provider = new OllamaProvider({ host: OLLAMA_HOST });
 
@@ -625,6 +1240,9 @@ async function main() {
       if (skills.length > 0) {
         registry.registerAll(skills);
         console.log(`Loaded ${skills.length} tool skills from ${skillsPath}`);
+        for (const skill of skills) {
+          skillsInfo.push({ name: skill.name, source: skillsPath, type: 'tool' });
+        }
       }
     } catch {}
   }
@@ -637,13 +1255,47 @@ async function main() {
       if (skills.length > 0) {
         promptSkills.push(...skills);
         console.log(`Loaded ${skills.length} prompt skills from ${skillsPath}`);
+        for (const skill of skills) {
+          skillsInfo.push({ name: skill.name, source: skillsPath, type: 'prompt' });
+        }
       }
     } catch {}
   }
 
+  // Load imported Claude skills from ~/.localbot/skills/claude-imported/
+  const importedSkillsDir = getImportedSkillsPath();
+  try {
+    const importedSkills = await loadMdSkills(importedSkillsDir, 'claude');
+    if (importedSkills.length > 0) {
+      promptSkills.push(...importedSkills);
+      console.log(`Loaded ${importedSkills.length} imported Claude skills from ${importedSkillsDir}`);
+      for (const skill of importedSkills) {
+        skillsInfo.push({ name: skill.name, source: importedSkillsDir, type: 'prompt' });
+      }
+    }
+  } catch {
+    // No imported skills yet
+  }
+
+  // Log skills loaded
+  terminalLogger.skillsLoaded(skillsInfo);
+
   // Load context from global + agent directories
   context = await loadContext(CONTEXT_DIR, AGENT_DIR);
   console.log(`Loaded ${context.files.length} context files from ${context.sources.join(', ') || 'no sources'}`);
+
+  // Load daily memory (clawdbot-style: today + yesterday)
+  memoryContext = await loadDailyMemory();
+  if (memoryContext) {
+    console.log(`Loaded daily memory from ${CONTEXT_DIR}/memory`);
+  }
+
+  // Load or create session (persistent)
+  await globalSessionManager.getSession(sessionId);
+  const stats = await globalSessionManager.getStats(sessionId);
+  if (stats && stats.messageCount > 0) {
+    console.log(`Restored session with ${stats.messageCount} messages`);
+  }
 
   // Load MCP servers
   const mcpServersCount = await loadMcpServers();
@@ -653,6 +1305,23 @@ async function main() {
 
   // Create agent
   agent = createAgent();
+
+  // Log tools loaded and calculate duration
+  terminalLogger.toolsLoaded(registry.size);
+  const durationMs = Date.now() - startTime;
+
+  // Create startup manifest
+  db.createStartupManifest({
+    started_at: startTime,
+    channel: 'terminal',
+    workspace_files: null,  // Already logged by workspace loader
+    skills_loaded: JSON.stringify(skillsInfo),
+    tools_count: registry.size,
+    model_default: currentModel,
+    duration_ms: durationMs,
+  });
+
+  terminalLogger.startupComplete(durationMs);
 
   // Print header
   printHeader();

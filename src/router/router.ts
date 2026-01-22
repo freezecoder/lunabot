@@ -56,6 +56,15 @@ export class ModelRouter {
     // Analyze the user message to determine routing
     const userMessage = lastMessage?.role === 'user' ? lastMessage.content : '';
 
+    // Check if this is a skill-injected message - use reasoning model for complex skill interpretation
+    if (userMessage.includes('## SKILL CONTEXT') || userMessage.includes('## SKILL INSTRUCTIONS')) {
+      return {
+        model: this.config.reasoningModel,
+        reason: 'Skill-injected message - needs reasoning',
+        useTools: true,
+      };
+    }
+
     // Check if this is a simple conversational message (no tools needed)
     if (this.isSimpleConversation(userMessage)) {
       return {
@@ -217,6 +226,7 @@ export const MODEL_CAPABILITIES: Record<string, { supportsTools: boolean; descri
   'qwen2.5:7b': { supportsTools: true, description: 'Fast, good tool support' },
   'qwen2.5:32b': { supportsTools: true, description: 'High quality, good tool support' },
   'qwen2.5:72b': { supportsTools: true, description: 'Best quality Qwen' },
+  'qwen3-coder:30b': { supportsTools: true, description: 'Qwen3 coder with tool support' },
   'deepseek-r1:14b': { supportsTools: false, description: 'Strong reasoning, no tools' },
   'deepseek-r1:32b': { supportsTools: false, description: 'Strong reasoning, no tools' },
   'mistral:7b': { supportsTools: true, description: 'Fast, tool support' },
@@ -243,7 +253,7 @@ export function checkModelToolSupport(model: string): boolean {
 
   // Default: assume tools are supported for llama and qwen families
   const lowerModel = model.toLowerCase();
-  if (lowerModel.includes('llama3') || lowerModel.includes('qwen2.5') ||
+  if (lowerModel.includes('llama3') || lowerModel.includes('qwen2') || lowerModel.includes('qwen3') ||
       lowerModel.includes('mistral') || lowerModel.includes('mixtral')) {
     return true;
   }

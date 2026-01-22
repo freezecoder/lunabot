@@ -10,6 +10,7 @@ export { gogTools, gmailSearchTool, gmailGetTool, gmailSendTool, calendarListToo
 export { apiTools, apiRequestTool, curlTool, jqTool, graphqlTool } from './api.js';
 export { documentTools, readDocumentTool, fetchDocumentTool, summarizeInstructionsTool } from './documents.js';
 export { memoryTools, memorySearchTool, memoryGetTool, memorySyncTool, memorySaveTool, memoryStatusTool } from './memory.js';
+export { reminderTool, setReminderTelegramChatId } from './reminder.js';
 
 import { bashTool } from './bash.js';
 import { fileTools } from './files.js';
@@ -19,6 +20,7 @@ import { gogTools } from './gog.js';
 import { apiTools } from './api.js';
 import { documentTools } from './documents.js';
 import { memoryTools } from './memory.js';
+import { reminderTool } from './reminder.js';
 import type { Tool } from '../../types.js';
 
 /**
@@ -33,6 +35,7 @@ export function getAllBuiltInTools(): Tool[] {
     ...gogTools,
     ...apiTools,
     ...documentTools,
+    reminderTool,
   ];
 
   // Only include memory tools if explicitly enabled
@@ -66,13 +69,14 @@ export function getSafeTools(): Tool[] {
 }
 
 /**
- * Get productivity tools (google + api)
+ * Get productivity tools (google + api + reminders)
  */
 export function getProductivityTools(): Tool[] {
   return [
     ...gogTools,
     ...apiTools,
     ...documentTools,
+    reminderTool,
   ];
 }
 
@@ -113,6 +117,11 @@ export function getToolsByCategory(categories: string[]): Tool[] {
         break;
       case 'memory':
         tools.push(...memoryTools);
+        break;
+      case 'reminder':
+      case 'reminders':
+      case 'cron':
+        tools.push(reminderTool);
         break;
       case 'all':
         return getAllBuiltInTools();

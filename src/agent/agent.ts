@@ -141,6 +141,10 @@ export class Agent {
       const route = this.router.route(session.messages, tools);
       const model = session.model || route.model;
 
+      const supportsTools = this.router.supportsTools(model);
+      const willUseTools = route.useTools && supportsTools;
+      console.log(`[Agent] Turn ${turn}: model=${model}, route.useTools=${route.useTools}, supportsTools=${supportsTools}, willUseTools=${willUseTools}`);
+
       yield { type: 'content', content: '', model };
 
       // Build messages with system prompt
@@ -153,7 +157,7 @@ export class Agent {
       const request: ChatRequest = {
         model,
         messages,
-        tools: route.useTools && this.router.supportsTools(model) ? tools : undefined,
+        tools: willUseTools ? tools : undefined,
         stream: true,
       };
 
@@ -170,6 +174,7 @@ export class Agent {
           }
 
           if (chunk.tool_calls) {
+            console.log(`[Agent] Received tool_calls from LLM:`, JSON.stringify(chunk.tool_calls));
             toolCalls = chunk.tool_calls;
           }
 
@@ -182,6 +187,7 @@ export class Agent {
           }
 
           if (chunk.done) {
+            console.log(`[Agent] Stream done. toolCalls.length=${toolCalls.length}, contentLength=${assistantContent.length}`);
             // Record token usage
             if (promptTokens > 0 || evalTokens > 0) {
               globalMetrics.recordTokenUsage(sessionId, promptTokens, evalTokens, model);
@@ -200,7 +206,9 @@ export class Agent {
 
         // Execute tool calls if any
         if (toolCalls.length > 0) {
+          console.log(`[Agent] Executing ${toolCalls.length} tool call(s)...`);
           for (const toolCall of toolCalls) {
+            console.log(`[Agent] Executing tool: ${toolCall.function.name}`);
             yield {
               type: 'tool_start',
               toolCall,
